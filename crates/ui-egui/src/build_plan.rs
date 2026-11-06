@@ -173,7 +173,7 @@ mod tests {
         std::fs::write(
             investigation.join("state.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version":1,
+                "version":1,"revision":1,
                 "build_plan":{
                     "version":1,"goal":"Restore saved notes",
                     "phases":[{"id":"storage","title":"Save notes","goal":"Restore a note","status":"done"}],
@@ -190,7 +190,7 @@ mod tests {
         current.manifest.checks.push(CheckResult::new("restore", 2, false, "The note is missing."));
         current.save().unwrap();
         let facts = Facts::read(&open_snapshot, None, 90.0);
-        assert!(facts.build_plan_error.is_none());
+        assert!(facts.build_plan_error.is_none(), "{:?}", facts.build_plan_error);
         assert!(facts.build_plan.unwrap().verified.is_empty(), "a failed saved repeat must revoke the displayed verification during the run");
 
         current.manifest.checks.push(CheckResult::new("restore", 3, true, "The note reopened again."));

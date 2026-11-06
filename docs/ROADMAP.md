@@ -417,7 +417,7 @@ The fork needs a durable project plan connecting requested capabilities, impleme
 required inputs and acceptance checks. An output that can be previewed must not be reported as
 complete while required checks or planned work remain unresolved.
 
-- [ ] Add versioned build plans with phases, required inputs, acceptance criteria, headless tools,
+- [x] Add versioned build plans with phases, required inputs, acceptance criteria, headless tools,
       builder integration and a project view; evaluate every final check and preserve an incomplete
       preview when verification fails — claimed: Codex, branch feature/r5.8-build-planning
 - [ ] Capture authenticated workflows and nested route/section states, and report redirected or
