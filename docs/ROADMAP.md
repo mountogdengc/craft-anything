@@ -426,6 +426,8 @@ complete while required checks or planned work remain unresolved.
       after relevant implementation changes.
 - [ ] Reconcile textual tool fallback handling with genuine tool results and prevent speculative
       action observations from being treated as completed work.
+- [ ] Add explicit scope revisions tied to the person's changed request, retaining the previous
+      requirements and reason for reduction; ordinary plan progress updates preserve required scope.
 
 ## M1 Extensibility
 

@@ -109,6 +109,7 @@ fn consumed_note_progress_errors_preserve_the_completed_turn() {
         std::fs::create_dir_all(ws.capture_dir()).unwrap();
         ws.manifest.stack = "Rust (console)".into();
         ws.save().unwrap();
+        completed_plan(&ws);
         let mut worker = check_worker(&ws, false);
         let seen = Arc::default();
         let model = NotesInTurn {
@@ -199,6 +200,7 @@ fn consumed_note_resets_survive_failed_and_cancelled_turns() {
                 progress.before_turn(ws.app_fingerprint(&CancelToken::default()).unwrap());
                 progress.unchanged_turns = 1;
                 progress.save(&ws.root).unwrap();
+                completed_plan(&ws);
                 let mut worker = check_worker(&ws, false);
                 let (tx, rx) = std::sync::mpsc::channel();
                 worker.tx = tx;

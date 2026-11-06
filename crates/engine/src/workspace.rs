@@ -78,10 +78,10 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize)
 }
 
 /// The current `craft.json` format version. Bumping it means appending a step to [`MANIFEST_STEPS`].
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// The steps that bring an older `craft.json` forward; step `i` goes from version `i` to `i + 1`.
-const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2];
+const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3];
 const _: () = assert!(MANIFEST_STEPS.len() == MANIFEST_VERSION as usize, "one step per craft.json version");
 
 /// Version 0 (no `version` field) has the same shape as version 1; only the number is new.
@@ -93,6 +93,12 @@ fn manifest_v0_to_v1(doc: &mut Value) -> Result<(), String> {
 /// both default to a project made the usual way. The number is new so an older build, which would
 /// look for the app in app/, opens such a project read-only instead of saving over it.
 fn manifest_v1_to_v2(doc: &mut Value) -> Result<(), String> {
+    if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
+}
+
+/// Version 3 can record an incomplete build separately from a ready or paused one. Existing
+/// statuses stay as they were: older checks don't establish whether the person called it done.
+fn manifest_v2_to_v3(doc: &mut Value) -> Result<(), String> {
     if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
 }
 
@@ -171,6 +177,8 @@ pub enum Status {
     Checking,
     /// Waiting for the person (a question, an approval, or after an error).
     NeedsYou,
+    /// The run ended with work still to do. Any available preview can still be opened.
+    Incomplete,
     Ready,
     Stopped,
 }
@@ -183,6 +191,7 @@ impl Status {
             Status::Building => "Building",
             Status::Checking => "Checking",
             Status::NeedsYou => "Needs you",
+            Status::Incomplete => "Needs more work",
             Status::Ready => "Ready",
             Status::Stopped => "Paused",
         }
@@ -308,6 +317,82 @@ impl CheckResult {
     /// The claims that don't hold yet.
     pub fn failed_claims(&self) -> impl Iterator<Item = &Claim> {
         self.claims.iter().filter(|c| !c.passed)
+    }
+}
+
+/// What the latest round establishes. Ready means its checks meet their own criteria;
+/// it does not claim that untested behaviour was verified. An empty history is never Ready.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CheckVerdict {
+    Unchecked,
+    Incomplete { round: u32, reasons: Vec<CheckBlocker> },
+    Ready { round: u32 },
+}
+
+/// A typed reason a check is not good enough. Notes explain the result; decisions use the
+/// check's fields, never the words in its note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckBlocker {
+    CheckFailed { check: String, detail: String },
+    ClaimFailed { check: String, title: String, detail: String },
+    MissingEvidence { check: String, detail: String },
+    BelowTarget { check: String, similarity: f64, required: f64 },
+}
+
+impl CheckVerdict {
+    /// Every check from the highest round contributes, in recorded order. Earlier rounds
+    /// remain history and cannot override the latest result, even when stored out of order.
+    pub fn latest(checks: &[CheckResult], good_enough: f64) -> Self {
+        let Some(round) = checks.iter().map(|c| c.round).max() else { return Self::Unchecked };
+        let latest = checks.iter().filter(|c| c.round == round);
+        if latest.clone().all(|c| c.good(good_enough)) {
+            return Self::Ready { round };
+        }
+        let mut reasons = Vec::new();
+        for result in latest.filter(|c| !c.good(good_enough)) {
+            if !result.passed {
+                reasons.push(CheckBlocker::CheckFailed { check: result.check.clone(), detail: result.note.clone() });
+            }
+            for claim in result.failed_claims() {
+                reasons.push(CheckBlocker::ClaimFailed { check: result.check.clone(), title: claim.title.clone(), detail: claim.detail.clone() });
+            }
+            for unknown in &result.unknowns {
+                reasons.push(CheckBlocker::MissingEvidence { check: result.check.clone(), detail: unknown.clone() });
+            }
+            let required = result.good_enough.unwrap_or(good_enough);
+            if let Some(similarity) = result.similarity
+                && similarity.partial_cmp(&required).is_none_or(|order| order.is_lt())
+            {
+                reasons.push(CheckBlocker::BelowTarget { check: result.check.clone(), similarity, required });
+            }
+        }
+        Self::Incomplete { round, reasons }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Plain words for the person and the builder, from the same typed verdict clients use.
+    pub fn explanation(&self) -> String {
+        match self {
+            Self::Unchecked => "No check results are available for this round.".into(),
+            Self::Ready { .. } => "The latest checks meet their criteria.".into(),
+            Self::Incomplete { reasons, .. } => reasons.iter().map(CheckBlocker::explanation).collect::<Vec<_>>().join("\n"),
+        }
+    }
+}
+
+impl CheckBlocker {
+    pub fn explanation(&self) -> String {
+        match self {
+            Self::CheckFailed { check, detail } => format!("{check}: the check failed. {detail}").trim().to_string(),
+            Self::ClaimFailed { check, title, detail } => format!("{check}: {title} is not met. {detail}").trim().to_string(),
+            Self::MissingEvidence { check, detail } => format!("{check}: evidence is missing. {detail}").trim().to_string(),
+            Self::BelowTarget { check, similarity, required } => format!("{check}: likeness is {similarity:.0}%; the target is {required:.0}%."),
+        }
     }
 }
 
@@ -665,8 +750,14 @@ impl Workspace {
         copy.manifest.stack.clone_from(&m.stack);
         copy.manifest.checks.clone_from(&m.checks);
         copy.manifest.last_reply.clone_from(&m.last_reply);
-        // Ready stays ready; anything else can carry on (with a new conversation).
-        copy.manifest.status = if m.status == Status::Ready { Status::Ready } else { Status::Stopped };
+        // Keep a finished verdict; anything else can carry on (with a new conversation).
+        copy.manifest.status = match m.status {
+            Status::Ready | Status::Incomplete => m.status,
+            _ => Status::Stopped,
+        };
+        if matches!(m.status, Status::Ready | Status::Incomplete) {
+            copy.manifest.note.clone_from(&m.note);
+        }
         copy.save()?;
         let (budget, generate, builder, allowed, questions) =
             (m.asset_budget_usd, m.generate_assets, m.builder.clone(), m.allowed_actions.clone(), m.questions);
@@ -1528,6 +1619,77 @@ mod tests {
         let c = CheckResult { claims: vec![held, broken], ..pics };
         assert!(!c.good(0.0), "a failed claim never rolls up into a pass");
         assert_eq!(c.failed_claims().map(|c| c.detail.as_str()).collect::<Vec<_>>(), ["/logo.png (404)"]);
+    }
+
+    #[test]
+    fn completion_requires_every_check_in_the_latest_round() {
+        assert_eq!(CheckVerdict::latest(&[], 90.0), CheckVerdict::Unchecked);
+        let failed = CheckResult::new(CheckResult::BUILD, 1, false, "Build failed.");
+        let passed = CheckResult::new("mechanics", 1, true, "Sheet passed.");
+        let verdict = CheckVerdict::latest(&[failed.clone(), passed], 90.0);
+        assert!(matches!(verdict, CheckVerdict::Incomplete { round: 1, ref reasons }
+            if matches!(reasons.as_slice(), [CheckBlocker::CheckFailed { check, .. }] if check == CheckResult::BUILD)));
+        assert!(!verdict.is_ready(), "a passing last check must not hide an earlier failure");
+        assert!(verdict.explanation().contains("Build failed."));
+
+        let repaired = CheckResult::new(CheckResult::BUILD, 2, true, "Build succeeded.");
+        assert_eq!(CheckVerdict::latest(&[failed, repaired], 90.0), CheckVerdict::Ready { round: 2 }, "old failures remain history");
+        let failed = CheckResult::new(CheckResult::BUILD, 2, false, "The latest build failed.");
+        let old_pass = CheckResult::new(CheckResult::BUILD, 1, true, "An earlier build passed.");
+        assert!(
+            matches!(CheckVerdict::latest(&[failed, old_pass], 90.0), CheckVerdict::Incomplete { round: 2, .. }),
+            "stored order does not choose the latest round"
+        );
+    }
+
+    #[test]
+    fn completion_explains_failed_claims_missing_evidence_and_likeness_separately() {
+        let check = CheckResult {
+            similarity: Some(27.0),
+            good_enough: Some(80.0),
+            claims: vec![Claim::new("Drafts survive reopening", false, "The saved draft disappeared.")],
+            unknowns: vec!["The equipment page could not be opened.".into()],
+            ..CheckResult::new(CheckResult::WEB_VISUAL, 3, true, "The site can be served.")
+        };
+        let verdict = CheckVerdict::latest(std::slice::from_ref(&check), 20.0);
+        let CheckVerdict::Incomplete { round, reasons } = &verdict else { panic!("{verdict:?}") };
+        assert_eq!(*round, 3);
+        assert!(matches!(
+            reasons.as_slice(),
+            [CheckBlocker::ClaimFailed { .. }, CheckBlocker::MissingEvidence { .. }, CheckBlocker::BelowTarget { similarity: 27.0, required: 80.0, .. }]
+        ));
+        let note = verdict.explanation();
+        assert!(note.contains("The saved draft disappeared.") && note.contains("equipment page") && note.contains("80%"), "{note}");
+        let repaired = CheckResult { similarity: Some(85.0), claims: Vec::new(), unknowns: Vec::new(), ..check };
+        assert!(CheckVerdict::latest(&[repaired], 90.0).is_ready(), "the check's own target applies");
+        let again: CheckVerdict = serde_json::from_str(&serde_json::to_string(&verdict).unwrap()).unwrap();
+        assert_eq!(again, verdict, "headless clients get the same typed reasons");
+    }
+
+    #[test]
+    fn completion_uses_check_fields_without_claiming_that_skipped_tests_ran() {
+        let skipped = CheckResult::new("tests", 1, true, "No tests ran: this project has no test command.");
+        assert!(CheckVerdict::latest(&[skipped], 90.0).is_ready(), "a check retains its existing skip policy");
+        let failed = CheckResult::new(CheckResult::BUILD, 1, false, "Build succeeded.");
+        assert!(!CheckVerdict::latest(&[failed], 90.0).is_ready(), "the words cannot override the typed failure");
+        let invalid = CheckResult { similarity: Some(f64::NAN), ..CheckResult::new(CheckResult::WEB_VISUAL, 1, true, "") };
+        assert!(!CheckVerdict::latest(&[invalid], 90.0).is_ready(), "an incomparable score is not a pass");
+    }
+
+    #[test]
+    fn incomplete_status_roundtrips_and_older_statuses_keep_their_meaning() {
+        let old = MANIFEST_V0.replacen('{', r#"{ "version": 2,"#, 1);
+        let manifest = read_manifest(old.as_bytes()).unwrap();
+        assert_eq!(manifest.version, MANIFEST_VERSION);
+        assert_eq!(manifest.status, Status::Ready, "old Ready may have been the person's choice");
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "Draft", "A notes app", TargetRef::None).unwrap();
+        ws.set_status(Status::Incomplete, "Drafts do not survive reopening yet.").unwrap();
+        let reopened = Workspace::open(&ws.root).unwrap();
+        assert_eq!(reopened.manifest.status, Status::Incomplete);
+        assert_eq!(reopened.manifest.version, 3);
+        let copy = reopened.duplicate("Draft copy").unwrap();
+        assert_eq!((copy.manifest.status, copy.manifest.note), (Status::Incomplete, ws.manifest.note));
     }
 
     #[test]

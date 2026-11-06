@@ -500,7 +500,7 @@ pub fn status_shown(app: &CraftApp, ws: &craft_anything_engine::workspace::Works
 pub fn status_colors(t: &Tokens, s: Status) -> (egui::Color32, egui::Color32) {
     match s {
         Status::Ready => (t.success, t.raised),
-        Status::NeedsYou => (t.warning, t.raised),
+        Status::NeedsYou | Status::Incomplete => (t.warning, t.raised),
         Status::Stopped | Status::New => (t.text_dim, t.raised),
         _ => (t.accent_ink, t.accent_soft),
     }

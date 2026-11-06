@@ -30,6 +30,7 @@ pub const TOOLS: &[&str] = &[
     "core_investigation_show",
     "core_brief_write",
     "core_plan_update",
+    "core_build_plan_update",
     "core_hypothesis_record",
     "core_hypothesis_update",
     "core_finding_record",

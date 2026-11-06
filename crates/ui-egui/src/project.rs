@@ -725,12 +725,27 @@ pub struct Facts {
     pub assets: (usize, f64),
     /// The builder's open questions, most important first.
     pub open_questions: Vec<String>,
+    /// The same durable plan the builder reads and the completion check evaluates.
+    pub build_plan: Option<crate::build_plan::View>,
+    /// Unreadable records are shown as a problem, never silently replaced by an old checklist.
+    pub build_plan_error: Option<String>,
 }
 
 impl Facts {
-    pub fn read(ws: &Workspace, godot: Option<&Path>) -> Facts {
+    pub fn read(ws: &Workspace, godot: Option<&Path>, good_enough: f64) -> Facts {
         let dir = ws.app_dir();
         let a = ws.assets();
+        let saved_plan = craft_anything_engine::tools::investigation_tools::load_project_strict(&ws.investigation_dir()).and_then(|investigation| {
+            let Some(plan) = investigation.build_plan else { return Ok(None) };
+            // The UI's workspace is a snapshot from before this run. Checks are saved between
+            // rounds, so read them here on the worker before displaying a criterion as verified.
+            let current = Workspace::open(&ws.root)?;
+            Ok(Some(crate::build_plan::View::new(plan, &current.manifest.checks, good_enough)))
+        });
+        let (build_plan, build_plan_error) = match saved_plan {
+            Ok(plan) => (plan, None),
+            Err(error) => (None, Some(error.message)),
+        };
         Facts {
             root: ws.root.clone(),
             site: rebuild::site_dir(&dir).is_some(),
@@ -739,6 +754,8 @@ impl Facts {
             // Summed from +0.0: an empty f64 `sum()` is -0.0, shown as "$-0.00".
             assets: (a.len(), a.iter().fold(0.0, |s, x| s + x.cost_usd)),
             open_questions: craft_anything_ai::rebuild::self_check::open_questions(ws).into_iter().map(|u| u.question).collect(),
+            build_plan,
+            build_plan_error,
         }
     }
 }
@@ -767,9 +784,10 @@ impl CraftApp {
             return;
         }
         let godot = self.game_engines.as_ref().and_then(|i| i.best(craft_anything_engines::game::Builder::Godot)).map(|i| i.program.clone());
+        let good_enough = self.settings.build.good_enough;
         r.wanted = false;
         r.at = Some(std::time::Instant::now());
-        r.job = Some(self.jobs.spawn("Read the project", false, move |_| Ok(Done::Facts(Facts::read(&ws, godot.as_deref())))));
+        r.job = Some(self.jobs.spawn("Read the project", false, move |_| Ok(Done::Facts(Facts::read(&ws, godot.as_deref(), good_enough)))));
     }
 
     pub(crate) fn facts_read(&mut self, job: u64, facts: Option<Facts>) {
@@ -837,6 +855,14 @@ fn asset_line(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
 fn current_step(app: &CraftApp, ws: &Workspace) -> Option<(Step, bool)> {
     if ws.manifest.status == Status::Ready {
         return Some((Step::Done, false));
+    }
+    if ws.manifest.status == Status::Incomplete {
+        let last = app.state.feed.iter().rev().find_map(|i| match i {
+            FeedItem::Step { step, .. } if *step != Step::Done => Some(*step),
+            _ => None,
+        });
+        let fallback = if ws.manifest.checks.is_empty() { Step::Study } else { Step::Check };
+        return Some((last.unwrap_or(fallback), false));
     }
     let last = app.state.feed.iter().rev().find_map(|i| if let FeedItem::Step { step, .. } = i { Some(*step) } else { None })?;
     Some((last, app.running()))
@@ -1195,7 +1221,7 @@ fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
     }
     let items = &app.state.feed;
     // With a plan pinned below, it shows the work and the clock; one progress display, not two.
-    let pinned = plan(items).is_some();
+    let pinned = app.facts.build_plan.is_some() || app.facts.build_plan_error.is_some() || plan(items).is_some();
     let status_row =
         app.running() && !pinned && !matches!(items.last(), Some(FeedItem::Agent { streaming: true, .. }) | Some(FeedItem::Ask { answer: None, .. }));
     if status_row {
@@ -1477,9 +1503,9 @@ pub fn interrupted(app: &CraftApp, ws: &Workspace) -> bool {
     !app.runs.is_busy(&ws.root) && matches!(ws.manifest.status, Status::Inspecting | Status::Building | Status::Checking)
 }
 
-/// The build can carry on where it stopped: it was paused, or interrupted.
+/// The build can carry on where it stopped: it was paused, interrupted, or left incomplete.
 pub fn can_continue(app: &CraftApp, ws: &Workspace) -> bool {
-    interrupted(app, ws) || (!app.runs.is_busy(&ws.root) && ws.manifest.status == Status::Stopped)
+    interrupted(app, ws) || (!app.runs.is_busy(&ws.root) && matches!(ws.manifest.status, Status::Stopped | Status::Incomplete))
 }
 
 /// "Paused" or "This build stopped part-way", with one Continue button: like a question card,
@@ -1491,6 +1517,8 @@ fn continue_card(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
             "This build stopped part-way",
             "Craft Anything or the computer closed while it was working. Everything so far is kept; Continue picks up where it stopped.",
         )
+    } else if ws.manifest.status == Status::Incomplete {
+        ("Needs more work", "There is work still to do. Continue builds on what is already there.")
     } else {
         ("Paused", "Everything so far is kept. Continue picks up where it stopped.")
     };
@@ -1506,6 +1534,9 @@ fn continue_card(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
         ui.horizontal(|ui| {
             go = widgets::primary_icon(ui, Some("play"), "Continue", true).clicked();
             done_button(app, ui, ws);
+            if ws.manifest.status == Status::Incomplete && outcome(app).is_some() {
+                outcome_button(app, ui, ws, 32.0, 13.0);
+            }
         });
     });
     ui.add_space(chat::MESSAGE_GAP);
@@ -1714,7 +1745,30 @@ fn check_card(app: &mut CraftApp, ui: &mut Ui, ctx: &egui::Context, ws: &Workspa
 
 fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens) {
     let running = app.running();
-    if let Some(steps) = plan(&app.state.feed).filter(|p| running || p.iter().any(|s| s.status != PlanStatus::Done)) {
+    if let Some(project_plan) = &app.facts.build_plan {
+        let shown_id = egui::Id::new("plan-steps-shown");
+        let mut height = app.state.plan_height;
+        let mut question = None;
+        ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
+            let shown = ui.data(|data| data.get_temp::<f32>(shown_id)).unwrap_or(PLAN_HEIGHT);
+            plan_divider(ui, t, &mut height, shown);
+            question = crate::build_plan::show(ui, project_plan, t, height.unwrap_or(PLAN_HEIGHT), shown_id);
+        });
+        app.state.plan_height = height;
+        if let Some(question) = question {
+            if !app.state.project_input.is_empty() {
+                app.state.project_input.push_str("\n\n");
+            }
+            app.state.project_input.push_str(&trf("About \"{question}\":", &[("question", &question)]));
+            app.state.project_input.push(' ');
+            app.state.just_ask = false;
+        }
+        ui.add_space(8.0);
+    } else if let Some(error) = &app.facts.build_plan_error {
+        ui.add(egui::Label::new(RichText::new(tr("The project plan could not be read.")).color(t.danger)).wrap());
+        ui.add(egui::Label::new(error).wrap());
+        ui.add_space(8.0);
+    } else if let Some(steps) = plan(&app.state.feed).filter(|p| running || p.iter().any(|s| s.status != PlanStatus::Done)) {
         let began = app.open_run().filter(|_| running).map(RebuildRun::started);
         let mut fold = false;
         let shown_id = egui::Id::new("plan-steps-shown");

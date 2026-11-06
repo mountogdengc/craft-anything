@@ -1,5 +1,7 @@
 # de: original German UI translations (informal "du"). Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Needs more work	Weitere Arbeit nötig
+There is work still to do. Continue builds on what is already there.	Es sind noch Aufgaben offen. Beim Fortsetzen wird auf dem bisherigen Ergebnis aufgebaut.
 OpenCode default	OpenCode-Standard
 Model default	Modellstandard
 Thinking depth	Denktiefe
@@ -1444,3 +1446,24 @@ Zoom	Zoomen
 Bring all to front	Alle nach vorne bringen
 Drag to give the plan more or less room; double-click to reset	Ziehen, um dem Plan mehr oder weniger Platz zu geben; Doppelklick setzt zurück
 Copy the message	Die Nachricht kopieren
+Project plan	Projektplan
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	{implemented} von {phases} Phasen umgesetzt · {verified} von {criteria} Kriterien geprüft
+Pending	Ausstehend
+In progress	In Arbeit
+Implemented	Umgesetzt
+Verified	Geprüft
+Needs verification	Prüfung erforderlich
+Required	Erforderlich
+Optional	Optional
+Inputs and answers	Angaben und Antworten
+Needed	Benötigt
+Requested	Angefragt
+Provided	Bereitgestellt
+Deferred	Zurückgestellt
+Useful format: {format}	Hilfreiches Format: {format}
+Needed for: {phases}	Benötigt für: {phases}
+Provide details	Details angeben
+About "{question}":	Zu „{question}“:
+The project plan could not be read.	Der Projektplan konnte nicht gelesen werden.
+Update the build plan	Build-Plan aktualisieren
+Keep the project phases, missing information and checks together in one plan.	Halte die Projektphasen, fehlenden Angaben und Prüfungen in einem Plan fest.

@@ -1,5 +1,7 @@
 # cs: original Czech UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Needs more work	Vyžaduje další práci
+There is work still to do. Continue builds on what is already there.	Zbývá nedokončená práce. Pokračování naváže na dosavadní výsledek.
 OpenCode default	Výchozí v OpenCode
 Model default	Výchozí pro model
 Thinking depth	Hloubka uvažování
@@ -1444,3 +1446,24 @@ Zoom	Zvětšit
 Bring all to front	Vše do popředí
 Drag to give the plan more or less room; double-click to reset	Přetažením dáte plánu víc nebo míň místa; dvojklikem vrátíte výchozí výšku
 Copy the message	Zkopírovat zprávu
+Project plan	Plán projektu
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	Implementováno {implemented} z {phases} fází · Ověřeno {verified} z {criteria} kritérií
+Pending	Čeká
+In progress	Probíhá
+Implemented	Implementováno
+Verified	Ověřeno
+Needs verification	Vyžaduje ověření
+Required	Povinné
+Optional	Volitelné
+Inputs and answers	Podklady a odpovědi
+Needed	Potřebné
+Requested	Vyžádáno
+Provided	Poskytnuto
+Deferred	Odloženo
+Useful format: {format}	Vhodný formát: {format}
+Needed for: {phases}	Potřebné pro: {phases}
+Provide details	Doplnit podrobnosti
+About "{question}":	K otázce „{question}“:
+The project plan could not be read.	Plán projektu se nepodařilo přečíst.
+Update the build plan	Aktualizovat plán sestavení
+Keep the project phases, missing information and checks together in one plan.	Uchovávejte fáze projektu, chybějící informace a kontroly v jednom plánu.

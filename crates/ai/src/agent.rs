@@ -276,6 +276,8 @@ pub struct LoopConfig {
 /// the builder's brief names: asking the person, the check, the generated assets and the unknowns.
 const LOCAL_BUILDER_CORE: &[&str] = &[
     "core_person_ask",
+    "core_investigation_show",
+    "core_build_plan_update",
     "rebuild_check",
     "rebuild_words",
     "assets_image_generate",
@@ -998,7 +1000,17 @@ pub(crate) mod tests {
         let lean = lean_for_local(all.clone(), &host);
         let names: Vec<&str> = lean.iter().map(|t| t.name.as_str()).collect();
         let size = |v: &[ToolDef]| v.iter().map(|t| t.description.len() + t.schema.to_string().len()).sum::<usize>();
-        for needed in ["build_file_write", "build_file_edit", "build_file_read", "build_files_list", "build_command_run", "core_person_ask", "rebuild_check"] {
+        for needed in [
+            "build_file_write",
+            "build_file_edit",
+            "build_file_read",
+            "build_files_list",
+            "build_command_run",
+            "core_person_ask",
+            "rebuild_check",
+            "core_investigation_show",
+            "core_build_plan_update",
+        ] {
             assert!(names.contains(&needed), "{needed} in {names:?}");
         }
         assert!(!names.contains(&"core_journal_read") && !names.contains(&"core_session_show"), "{names:?}");

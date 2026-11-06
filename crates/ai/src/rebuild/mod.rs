@@ -22,7 +22,7 @@ use crate::{AgentEvent, AiHub, BackendKind, Conversation, Role};
 use craft_anything_engine::inbox::{Answer, Inbox, InboxDir, Request};
 use craft_anything_engine::project::{Project, Purpose};
 use craft_anything_engine::workspace::progress::{AppFingerprintCache, BuildProgress};
-use craft_anything_engine::workspace::{CheckResult, ProjectUsage, Status, TargetRef, Workspace};
+use craft_anything_engine::workspace::{CheckResult, CheckVerdict, ProjectUsage, Status, TargetRef, Workspace};
 use craft_anything_engine::{CallOptions, Caller, CancelToken, Engine, ToolOutput};
 use craft_anything_engines::game;
 use craft_anything_evidence::{ErrorCode, ToolError};
@@ -45,6 +45,7 @@ pub mod kinds;
 mod locate;
 pub mod notes;
 mod output;
+mod planning;
 pub mod project;
 pub mod question;
 pub mod runs;
@@ -86,6 +87,8 @@ pub enum RunEvent {
     /// The build can be previewed here.
     Preview(String),
     Finished {
+        /// The project reached Ready. An incomplete run still sends its terminal event, with
+        /// `ok: false`, while keeping its preview and reasons in the project.
         ok: bool,
         message: String,
         /// The person paused it: not a failure.
@@ -263,7 +266,7 @@ impl RebuildRun {
                 let _here = self_check::BuildingHere::new(&ws.root);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run(&mut ws, entry, api, extractor, &opts)));
                 let (ok, message, paused) = match result {
-                    Ok(Ok(m)) => (true, m, false),
+                    Ok(Ok(m)) => (ws.manifest.status == Status::Ready, m, false),
                     Ok(Err(e)) if e.code == ErrorCode::Cancelled => {
                         let _ = ws.set_status(Status::Stopped, "Paused. Send a message to continue.");
                         (false, "Paused.".to_string(), true)
@@ -590,7 +593,7 @@ impl Worker {
     /// in rounds until it's good enough or the rounds run out. A coding agent's saved session is
     /// put back from the project first when this computer doesn't have it, and the project keeps
     /// a copy after every turn; when it can't be resumed, a new one starts from the brief and what
-    /// the project kept. Returns the summary shown when it's ready.
+    /// the project kept. Returns the summary of a ready or incomplete build.
     fn run(
         &mut self,
         ws: &mut Workspace,
@@ -704,7 +707,51 @@ impl Worker {
         } else if ws.manifest.not_working_checks >= NOT_WORKING_CHECK_LIMIT {
             return Err(not_working(ws));
         }
+        // A new or legacy project first records its product scope. Planning does not consume
+        // an unchanged-source attempt, and no implementation turn starts without a saved plan.
+        if planning::load(ws)?.is_none() {
+            self.step(ws, Step::Study, Status::Inspecting, "Planning phases and needed inputs…")?;
+            let plan_prompt = format!("{prompt}\n\n{}", planning::PLAN_ONLY);
+            let plan_fresh = fresh.take().map(|brief| format!("{brief}\n\n{}", planning::PLAN_ONLY));
+            let reply = self.turn(ws, agent.as_mut(), &plan_prompt, plan_fresh);
+            if let Some(adapter) = &keeper {
+                self.keep_session(ws, adapter.as_ref());
+            }
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(error) => {
+                    agent.stop();
+                    drop(agent);
+                    if self.reset_progress_after_notes
+                        && let Err(reset_error) = self.progress_after_notes(ws)
+                    {
+                        self.emit(RunEvent::Agent(AgentEvent::Status {
+                            text: format!("The new request couldn't reset the unchanged-turn count ({}).", reset_error.message),
+                        }));
+                    }
+                    return Err(error);
+                }
+            };
+            if !reply.trim().is_empty() {
+                ws.manifest.last_reply = reply.trim().to_string();
+            }
+            self.progress_after_notes(ws)?;
+            if planning::load(ws)?.is_none() {
+                let summary = format!("Needs more work. {} Continue to record the plan before implementation.", planning::MISSING_PLAN);
+                ws.set_status(Status::Incomplete, summary.clone())?;
+                self.emit(RunEvent::Step { step: Step::Study, text: summary.clone() });
+                return Ok(summary);
+            }
+            ws.save()?;
+            prompt = planning::START_PHASE.to_string();
+            if let Some(added) = self.added(ws) {
+                prompt = added + "\n\n" + planning::START_PHASE;
+            }
+        }
         let mut refinements = 0;
+        // Verification bookkeeping can progress without editing application files. These turns
+        // are still bounded by max_rounds; failed checks restore the ordinary source-stall guard.
+        let mut plan_refinement = false;
         // Deep mode on a program: decompiling is required, so a build turn without any gets one reminder.
         let must_decompile = !self.engine.session().clean_room() && matches!(ws.manifest.target, TargetRef::Local { .. });
         let mut reminded = false;
@@ -713,7 +760,7 @@ impl Worker {
         loop {
             if !std::mem::take(&mut only_check) {
                 progress = BuildProgress::load(&ws.root)?;
-                if let Some(fingerprint) = self.progress_fingerprint(ws, &mut progress, &mut progress_available, &mut fingerprints)? {
+                if !plan_refinement && let Some(fingerprint) = self.progress_fingerprint(ws, &mut progress, &mut progress_available, &mut fingerprints)? {
                     progress.before_turn(fingerprint);
                     if progress.stalled() {
                         return Err(no_build_progress(ws));
@@ -768,7 +815,7 @@ impl Worker {
                 // A consumed note starts another attempt, but its record I/O must not
                 // interrupt a live builder or enter the provider retry path.
                 progress = self.progress_after_notes(ws)?;
-                if let Some(fingerprint) = self.progress_fingerprint(ws, &mut progress, &mut progress_available, &mut fingerprints)? {
+                if !plan_refinement && let Some(fingerprint) = self.progress_fingerprint(ws, &mut progress, &mut progress_available, &mut fingerprints)? {
                     progress.after_turn(fingerprint);
                     progress.save(&ws.root)?;
                 }
@@ -777,6 +824,7 @@ impl Worker {
                     progress.reset();
                     progress.save(&ws.root)?;
                     ws.manifest.not_working_checks = 0;
+                    plan_refinement = false;
                     prompt = p;
                     continue;
                 }
@@ -789,12 +837,20 @@ impl Worker {
             round += 1;
             let checking = if ws.manifest.target == TargetRef::None { "Checking the build…" } else { "Checking the build against the original…" };
             self.step(ws, Step::Check, Status::Checking, checking)?;
-            let checks = self.checks_with_a_retry(ws, kind, round)?;
+            let mut checks = self.checks_with_a_retry(ws, kind, round)?;
+            // Later tools and UI views must judge the result by this run's quality target.
+            // Preserve any explicit target supplied by the check itself.
+            for check in &mut checks {
+                if check.similarity.is_some() && check.good_enough.is_none() {
+                    check.good_enough = Some(opts.good_enough);
+                }
+            }
             ws.manifest.checks.extend(checks.iter().cloned());
             ws.manifest.awaiting_check = false;
             // A round in which every check works (built and served) ends the streak; any other
             // round adds to it, across runs, until the limit stops the build.
-            ws.manifest.not_working_checks = if checks.iter().all(|c| c.passed) { 0 } else { ws.manifest.not_working_checks.saturating_add(1) };
+            ws.manifest.not_working_checks =
+                if !checks.is_empty() && checks.iter().all(|c| c.passed) { 0 } else { ws.manifest.not_working_checks.saturating_add(1) };
             ws.save()?;
             for c in &checks {
                 self.emit(RunEvent::Checked(c.clone()));
@@ -803,10 +859,12 @@ impl Worker {
                 progress.reset();
                 progress.save(&ws.root)?;
                 ws.manifest.not_working_checks = 0;
+                plan_refinement = false;
                 prompt = p;
                 continue;
             }
             let not_good = checks.iter().find(|c| !c.good(opts.good_enough));
+            let plan_review = planning::review(ws, opts.good_enough)?;
             if not_good.is_some() && progress_available && progress.stalled() {
                 // A check-only resume skipped the builder's before-turn scan. A real edit
                 // while the project was closed (or during this check) still starts an attempt.
@@ -818,7 +876,9 @@ impl Worker {
                     }
                 }
             }
-            let Some(check) = not_good else { break };
+            if checks.is_empty() || (not_good.is_none() && plan_review.complete()) {
+                break;
+            }
             if ws.manifest.not_working_checks >= NOT_WORKING_CHECK_LIMIT {
                 return Err(not_working(ws));
             }
@@ -826,37 +886,53 @@ impl Worker {
                 break;
             }
             refinements += 1;
+            plan_refinement = not_good.is_none();
             // Nothing written yet: a fix for a build that doesn't exist sends the builder looking for one.
             // It is asked to write the project and to show its build output (#736).
-            let refined = if app_is_empty(ws) { NO_PROJECT_PROMPT.to_string() } else { kind.refine(check) };
+            let refined = if app_is_empty(ws) {
+                NO_PROJECT_PROMPT.to_string()
+            } else if let Some(check) = not_good {
+                kind.refine(check)
+            } else {
+                plan_review.refinement_prompt()
+            };
             prompt = refined + &pictures_reminder(ws);
             if !api_loop {
                 prompt.push_str(CHECK_BEFORE_REPLYING);
             }
         }
+        self.finish_checks(ws, round, opts.good_enough)
+    }
+
+    /// Keep an available preview even when a check still needs work. All of the latest round
+    /// decides readiness; a passing final check cannot hide a failure earlier in that round.
+    fn finish_checks(&mut self, ws: &mut Workspace, round: u32, good_enough: f64) -> Result<String, ToolError> {
         if let Some(url) = self.preview.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(StaticServer::url) {
             self.emit(RunEvent::Preview(url));
         }
-        let last = ws.manifest.checks.last().cloned();
-        // A site that builds but isn't close enough is still usable; no working build is not.
-        let usable = last.as_ref().is_some_and(|c| c.passed);
-        if !usable {
-            let why = last.map(|c| c.note).unwrap_or_default();
-            return Err(ToolError::new(ErrorCode::ProgramFailed, format!("The build isn't working yet. {why}").trim().to_string())
-                .with_remediation("Ask for a fix in the box below, or press Try again."));
-        }
-        let last = ws.manifest.checks.last().cloned();
-        // The last round's checks, all of them: the last one alone (say a mechanics sheet) isn't the verdict.
-        let last_round: Vec<CheckResult> = last.map(|l| ws.manifest.checks.iter().filter(|c| c.round == l.round).cloned().collect()).unwrap_or_default();
-        let mut summary = if last_round.is_empty() { "Ready.".to_string() } else { format!("Ready: {}.", self_check::summary(&last_round, opts.good_enough)) };
+        let last_round: Vec<CheckResult> = ws.manifest.checks.iter().filter(|c| c.round == round).cloned().collect();
+        let verdict = CheckVerdict::latest(&last_round, good_enough);
+        let plan_review = planning::review(ws, good_enough)?;
+        let (status, step, mut summary) = if verdict.is_ready() && plan_review.complete() {
+            (Status::Ready, Step::Done, format!("Ready: {}.", self_check::summary(&last_round, good_enough)))
+        } else {
+            let mut reasons = Vec::new();
+            if !verdict.is_ready() {
+                reasons.push(verdict.explanation());
+            }
+            if !plan_review.complete() {
+                reasons.push(plan_review.explanation());
+            }
+            (Status::Incomplete, Step::Check, format!("Needs more work.\n{}", reasons.join("\n")))
+        };
         // What the builder couldn't find out is said, not hidden.
         match self_check::open_questions(ws).len() {
             0 => {}
             1 => summary.push_str(" 1 question about the original is still open."),
             n => summary.push_str(&format!(" {n} questions about the original are still open.")),
         }
-        ws.set_status(Status::Ready, summary.clone())?;
-        self.emit(RunEvent::Step { step: Step::Done, text: summary.clone() });
+        ws.set_status(status, summary.clone())?;
+        self.emit(RunEvent::Step { step, text: summary.clone() });
         Ok(summary)
     }
 
@@ -1220,7 +1296,7 @@ fn kept_session(ws: &Workspace) -> Option<String> {
 }
 
 /// What an API-backend builder is told first: its tools differ from an agent app's.
-const API_BUILDER: &str = "Your tools: build_files_list, build_file_read, build_file_write and build_file_edit for the project's files (paths relative to the project folder, e.g. app/src/main.rs), and build_command_run for commands, which run in app/ (never start dev servers or watchers). Where the steps below mention Read, Write, Edit or Bash, use these. For the checklist step use build_checklist (the same shape as TodoWrite: todos with content, activeForm and status) and call it again as you go. You can't look at pictures: use capture/README.md, capture/capture.json and the evidence instead. Ask the person with core_person_ask only when a choice really changes the result. Other Craft Anything tools are available too; enable a toolset with enable_toolset when you need it. rebuild_check isn't available in this loop: Craft Anything checks your build after each turn instead.";
+const API_BUILDER: &str = "Your tools: build_files_list, build_file_read, build_file_write and build_file_edit for the project's files (paths relative to the project folder, e.g. app/src/main.rs), and build_command_run for commands, which run in app/ (never start dev servers or watchers). Where the steps below mention Read, Write, Edit or Bash, use these. For the project plan, use core_investigation_show and core_build_plan_update; keep its phases, required inputs and acceptance criteria current. You can't look at pictures: use capture/README.md, capture/capture.json and the evidence instead. Ask the person with core_person_ask only when a choice really changes the result. Other Craft Anything tools are available too; enable a toolset with enable_toolset when you need it. rebuild_check isn't available in this loop: Craft Anything checks your build after each turn instead.";
 
 /// Added to a refinement for a builder that can check its own work.
 const CHECK_BEFORE_REPLYING: &str = " Before you reply, check your build again with rebuild_check and fix what it still lists.";

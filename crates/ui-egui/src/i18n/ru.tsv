@@ -1,5 +1,7 @@
 # ru: Russian UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>Russian text. Keep placeholders and escapes intact.
+Needs more work	Требует доработки
+There is work still to do. Continue builds on what is already there.	Есть незавершённая работа. Продолжение сохранит уже сделанное.
  GB	 ГБ
  and {n} more	 и ещё {n}
  {ascii}	 {ascii}
@@ -1444,3 +1446,24 @@ Zoom	Изменить масштаб
 Bring all to front	Все окна — на передний план
 Drag to give the plan more or less room; double-click to reset	Перетащите, чтобы дать плану больше или меньше места; двойной щелчок возвращает как было
 Copy the message	Скопировать сообщение
+Project plan	План проекта
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	Реализовано этапов: {implemented} из {phases} · Проверено критериев: {verified} из {criteria}
+Pending	Ожидает
+In progress	В работе
+Implemented	Реализовано
+Verified	Проверено
+Needs verification	Нужна проверка
+Required	Обязательно
+Optional	Необязательно
+Inputs and answers	Данные и ответы
+Needed	Нужно
+Requested	Запрошено
+Provided	Предоставлено
+Deferred	Отложено
+Useful format: {format}	Подходящий формат: {format}
+Needed for: {phases}	Нужно для: {phases}
+Provide details	Указать подробности
+About "{question}":	По вопросу «{question}»:
+The project plan could not be read.	Не удалось прочитать план проекта.
+Update the build plan	Обновить план сборки
+Keep the project phases, missing information and checks together in one plan.	Храните этапы проекта, недостающие сведения и проверки в одном плане.

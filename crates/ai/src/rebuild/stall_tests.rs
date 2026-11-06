@@ -49,6 +49,7 @@ fn run_idle_builder(create_app_dir: bool) -> (ToolError, Vec<Vec<Msg>>) {
     }
     ws.manifest.stack = "Scripted stack".into();
     ws.save().unwrap();
+    completed_plan(&ws);
     let mut worker = check_worker(&ws, false);
     let seen = Arc::default();
     let turns = (0..20).map(|_| turn(vec![Block::Text { text: "Built it and ran npm run build.".into() }], StopReason::EndTurn)).collect();
@@ -123,8 +124,10 @@ impl ChatModel for Busy {
 }
 
 /// One run of the build (a request, or "Try again" when `message` is `None`), with a builder
-/// that keeps changing files and a check that never passes.
-fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Option<&str>) -> ToolError {
+/// that keeps changing files and a check that never passes. A round limit keeps an incomplete
+/// result; the cross-run guard returns an error before another builder turn.
+fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Option<&str>) -> String {
+    completed_plan(ws);
     let mut worker = check_worker(ws, false);
     let model = Busy { app: ws.app_dir(), turn: 0, seen: Arc::clone(seen) };
     let slot = ModelSlot { name: "Busy".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
@@ -143,7 +146,13 @@ fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Optio
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(NeverBuilt));
     let opts = RunOptions { message: message.map(str::to_string), continuing: message.is_none(), kinds, max_rounds: 6, ..RunOptions::default() };
-    worker.run(ws, entry, Some(api), None, &opts).unwrap_err()
+    match worker.run(ws, entry, Some(api), None, &opts) {
+        Ok(summary) => {
+            assert_eq!(ws.manifest.status, Status::Incomplete);
+            summary
+        }
+        Err(error) => error.message,
+    }
 }
 
 #[test]
@@ -154,7 +163,7 @@ fn try_again_does_not_restart_a_build_that_never_works() {
     ws.save().unwrap();
     let seen = Arc::new(Mutex::new(0));
     let first = run_busy_builder(&mut ws, &seen, Some("Build the app"));
-    assert!(first.message.contains("isn't working yet"), "{first:?}");
+    assert!(first.contains("Needs more work"), "{first}");
     // Try again, many times: each press must not buy another full set of rounds.
     for _ in 0..5 {
         run_busy_builder(&mut ws, &seen, None);
@@ -166,13 +175,13 @@ fn try_again_does_not_restart_a_build_that_never_works() {
     // Once at the limit, Try again stops before paying for another builder turn.
     let turns = *seen.lock().unwrap();
     let stopped = run_busy_builder(&mut ws, &seen, None);
-    assert!(stopped.message.contains("in a row"), "{stopped:?}");
+    assert!(stopped.contains("in a row"), "{stopped}");
     assert_eq!(*seen.lock().unwrap(), turns, "no builder turn is started at the limit");
     assert_eq!(ws.manifest.checks.len(), total, "and no check runs either");
 
     // A new request starts the count again: the build gets its checks back.
     let restarted = run_busy_builder(&mut ws, &seen, Some("Use a plain page instead"));
-    assert!(restarted.message.contains("isn't working yet"), "{restarted:?}");
+    assert!(restarted.contains("Needs more work"), "{restarted}");
     assert!(ws.manifest.checks.len() > total, "a new request runs checks again");
     assert!(ws.manifest.not_working_checks <= NOT_WORKING_CHECK_LIMIT, "{}", ws.manifest.not_working_checks);
 }
