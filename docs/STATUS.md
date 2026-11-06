@@ -1,13 +1,14 @@
 # Status
 
 What works today and how it was checked. The plan, owners and order of work are in
-[ROADMAP.md](ROADMAP.md). Last updated 2026-11-04. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
+[ROADMAP.md](ROADMAP.md). Last updated 2026-11-06. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
 workspace clippy, layers, fmt and the secret scan of all history were clean. Chinese UI checks are listed separately below.
 
 ## What works, and how it was checked
 
 | Area | State | Verified by |
 |---|---|---|
+| Planned builds and completion | The builder records durable phases, dependencies, required inputs and acceptance before its implementation turn. The project view separates implemented from verified work and prepares input replies without submitting them. Automatic Ready requires every current check and the required plan obligations; incomplete builds retain their preview. See [planned builds](build-planning.md) | Synthetic model/tool regressions cover migrations, invalid state, revision conflicts, missing evidence, dependency blockers and retained scope. A scripted API-builder run saves a plan, writes a draft, records verification and completes after a passing repeat; UI regressions cover input replies and current saved check history. No live paid-agent build or Windows desktop run was performed for this change. Broader automatic workflow tests and verification invalidation after source changes remain roadmap work |
 | Java decompilation | `java_vineflower_decompile` decompiles a real JAR to source with the pinned Vineflower 1.12.0, run through the configured Java | Live run on Linux x86-64 (OpenJDK 21.0.12.1) against Apache Commons IO 2.16.1 (497 KB, 374 entries): 253 source files, exit 0; `org.apache.commons.io.FileUtils` returned 1,350 lines with the class and its file-reading methods present. The engine install matched the pinned SHA-256. Not checked: Windows and macOS, a `.class` input, or a second JAR |
 | Conversation width | Agent paragraphs, inline code and fenced code stay within the message column, including glossary terms followed by long file links (#523) | UI regression checks painted text and subsequent answers against the composer bounds in Project and Ask at 1920 × 1032 and 1280 × 820; Unicode/formatted glossary hover check |
 | Settings saved on exit | Pending app settings merge the session's latest AI table when its guard is available. A busy session defers non-AI edits in `config.pending.toml` without waiting for the tool; startup recovers them with the latest committed AI table | Isolated child-process regression exercises idle and busy exit saves, a late AI commit, startup recovery and pending non-AI edits; engine tests cover sidecar migrations and damaged/newer files. No live desktop shutdown was exercised |

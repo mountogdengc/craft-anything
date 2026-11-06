@@ -1,5 +1,7 @@
 # zh-hans: original Chinese UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Needs more work	仍需完善
+There is work still to do. Continue builds on what is already there.	仍有工作尚未完成。继续将在现有成果的基础上进行。
 OpenCode default	OpenCode 默认设置
 Model default	模型默认设置
 Thinking depth	思考深度
@@ -1444,3 +1446,24 @@ Zoom	缩放
 Bring all to front	前置全部窗口
 Drag to give the plan more or less room; double-click to reset	拖动以调整计划占用的空间；双击恢复默认
 Copy the message	复制这条消息
+Project plan	项目计划
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	已实现 {implemented}/{phases} 个阶段 · 已验证 {verified}/{criteria} 项标准
+Pending	待处理
+In progress	进行中
+Implemented	已实现
+Verified	已验证
+Needs verification	需要验证
+Required	必需
+Optional	可选
+Inputs and answers	所需信息与回答
+Needed	需要
+Requested	已请求
+Provided	已提供
+Deferred	已推迟
+Useful format: {format}	建议格式：{format}
+Needed for: {phases}	用于：{phases}
+Provide details	提供详细信息
+About "{question}":	关于“{question}”：
+The project plan could not be read.	无法读取项目计划。
+Update the build plan	更新构建计划
+Keep the project phases, missing information and checks together in one plan.	将项目阶段、缺失信息和检查保存在同一份计划中。

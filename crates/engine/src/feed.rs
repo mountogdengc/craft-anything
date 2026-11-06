@@ -196,6 +196,10 @@ pub fn history(ws: &Workspace) -> Vec<FeedItem> {
     if matches!(m.status, Status::NeedsYou) && !m.note.is_empty() {
         feed.push(FeedItem::Error { message: m.note.clone(), remediation: None, log: None });
     }
+    if m.status == Status::Incomplete && !m.note.is_empty() {
+        let step = if m.checks.is_empty() { Step::Study } else { Step::Check };
+        feed.push(FeedItem::Step { step, text: m.note.clone() });
+    }
     feed.extend(Inbox::new(ws.inbox_dir()).pending().into_iter().map(|request| FeedItem::Ask { request, answer: None }));
     feed
 }
@@ -258,6 +262,31 @@ mod tests {
         assert!(matches!(&f[0], FeedItem::User(r) if r.text() == "Clone it"));
         assert!(matches!(f.last(), Some(FeedItem::Ask { answer: None, .. })), "pending questions come back");
         assert_eq!(f.len(), 4);
+    }
+
+    #[test]
+    fn incomplete_reasons_survive_a_missing_or_unreadable_feed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Draft", "A notes app", TargetRef::None).unwrap();
+        ws.manifest.checks.push(CheckResult::new("persistence", 1, false, "Drafts disappear."));
+        ws.set_status(Status::Incomplete, "Drafts do not survive reopening yet.").unwrap();
+        for broken in [false, true] {
+            if broken {
+                std::fs::write(ws.root.join(FEED_FILE), "{").unwrap();
+            }
+            let items = load(&Workspace::open(&ws.root).unwrap());
+            assert!(matches!(items.last(), Some(FeedItem::Step { step: Step::Check, text }) if text == &ws.manifest.note));
+            assert!(!items.iter().any(|i| matches!(i, FeedItem::Step { step: Step::Done, .. } | FeedItem::Error { .. })));
+        }
+    }
+
+    #[test]
+    fn an_incomplete_plan_without_checks_does_not_imply_the_build_ran() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Draft", "A notes app", TargetRef::None).unwrap();
+        ws.set_status(Status::Incomplete, "The project plan is not ready yet.").unwrap();
+        let items = history(&ws);
+        assert!(matches!(items.last(), Some(FeedItem::Step { step: Step::Study, .. })));
     }
 
     #[test]

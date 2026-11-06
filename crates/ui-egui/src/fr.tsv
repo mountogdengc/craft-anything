@@ -1,4 +1,6 @@
 # French UI catalog: English key<TAB>French text. See i18n.rs.
+Needs more work	Travail restant
+There is work still to do. Continue builds on what is already there.	Il reste du travail à faire. Continuer permet de reprendre ce qui a déjà été réalisé.
 Attach pictures (or drop or paste them here)	Joindre des images (ou les déposer ou coller ici)
 Coding agent app	Application d'agent de code
 Load a picture	Charger une image
@@ -879,3 +881,24 @@ Zoom	Réduire/agrandir
 Bring all to front	Tout ramener au premier plan
 Drag to give the plan more or less room; double-click to reset	Faites glisser pour donner plus ou moins de place au plan ; double-cliquez pour rétablir
 Copy the message	Copier le message
+Project plan	Plan du projet
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	{implemented} phases réalisées sur {phases} · {verified} critères vérifiés sur {criteria}
+Pending	En attente
+In progress	En cours
+Implemented	Réalisé
+Verified	Vérifié
+Needs verification	À vérifier
+Required	Obligatoire
+Optional	Facultatif
+Inputs and answers	Informations et réponses
+Needed	Nécessaire
+Requested	Demandé
+Provided	Fourni
+Deferred	Reporté
+Useful format: {format}	Format utile : {format}
+Needed for: {phases}	Nécessaire pour : {phases}
+Provide details	Fournir des précisions
+About "{question}":	À propos de « {question} » :
+The project plan could not be read.	Le plan du projet n’a pas pu être lu.
+Update the build plan	Mettre à jour le plan de réalisation
+Keep the project phases, missing information and checks together in one plan.	Regroupez les phases du projet, les informations manquantes et les vérifications dans un seul plan.

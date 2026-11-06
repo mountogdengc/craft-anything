@@ -76,8 +76,9 @@ pub fn apply(feed: &mut Vec<FeedItem>, e: &RunEvent) {
         RunEvent::Preview(_) => {}
         RunEvent::Finished { ok, message, paused } => {
             end_stream(feed);
-            // An agent error already explains itself; don't say it twice.
-            let explained = matches!(feed.last(), Some(FeedItem::Error { .. }));
+            // An agent error or the final incomplete-run summary already explains itself;
+            // don't repeat it as another error card.
+            let explained = matches!(feed.last(), Some(FeedItem::Error { .. })) || matches!(feed.last(), Some(FeedItem::Step { text, .. }) if text == message);
             if *paused {
                 feed.push(FeedItem::Paused);
             } else if !ok && !explained {
@@ -170,6 +171,18 @@ impl FeedLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_incomplete_terminal_event_keeps_one_explanation_and_no_done_step() {
+        for (step, message) in [(Step::Study, "Needs more work. The plan is not ready."), (Step::Check, "Needs more work. Drafts do not survive reopening.")] {
+            let mut feed = Vec::new();
+            apply(&mut feed, &RunEvent::Step { step, text: message.into() });
+            apply(&mut feed, &RunEvent::Finished { ok: false, message: message.into(), paused: false });
+            assert!(matches!(feed.as_slice(), [FeedItem::Step { step: found, text }] if found == &step && text == message));
+            apply(&mut feed, &RunEvent::Finished { ok: false, message: "The check could not start.".into(), paused: false });
+            assert!(matches!(feed.last(), Some(FeedItem::Error { message, .. }) if message == "The check could not start."), "an unexplained error is kept");
+        }
+    }
 
     #[test]
     fn every_event_counts_as_activity() {

@@ -619,6 +619,62 @@ fn a_finished_game_offers_to_play_it() {
 }
 
 #[test]
+fn an_incomplete_preview_offers_to_continue_without_showing_all_steps_done() {
+    use craft_anything_engine::feed::FeedItem;
+    use craft_anything_engine::workspace::{CheckResult, Status, Step, TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Draft", "A website", TargetRef::None).unwrap();
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.app_dir().join("index.html"), "<h1>Draft</h1>").unwrap();
+    ws.manifest.checks.push(CheckResult::new("persistence", 1, false, "Drafts disappear."));
+    ws.set_status(Status::Incomplete, "Drafts do not survive reopening yet.").unwrap();
+    let root = ws.root.clone();
+    let mut h = harness(move || {
+        let mut app = demo::app(demo::engine(Mode::Beginner, true));
+        app.workspace = Some(ws);
+        // An older ready run must not override the current incomplete status.
+        app.state.feed = vec![FeedItem::Step { step: Step::Done, text: "An earlier version was ready.".into() }];
+        app.state.screen = Screen::Project;
+        app
+    });
+    assert!(wait(&mut h, |app| app.facts.site));
+    h.run_steps(2);
+    assert!(h.query_all_by_label("Needs more work").count() > 0);
+    h.get_by_label("Check: Stopped here");
+    h.get_by_label("Continue");
+    assert!(h.query_by_label("Ready: Done").is_none());
+    assert!(h.query_by_label("Your website is ready").is_none());
+    assert_eq!(h.get_all_by_label("Open the website").count(), 2, "the preview remains available in the sidebar and continue card");
+    h.get_by_label("It's done").click();
+    assert!(wait(&mut h, |app| app.workspace.as_ref().is_some_and(|w| w.manifest.status == Status::Ready)));
+    h.run_steps(2);
+    assert_eq!(Workspace::open(&root).unwrap().manifest.status, Status::Ready, "the person can still accept the current build");
+    assert!(h.query_by_label("Continue").is_none());
+    h.get_by_label(craft_anything_engine::tools::project_tools::CALLED_DONE);
+}
+
+#[test]
+fn an_incomplete_initial_plan_keeps_progress_at_study() {
+    use craft_anything_engine::feed::FeedItem;
+    use craft_anything_engine::workspace::{Status, Step, TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Draft", "A notes app", TargetRef::None).unwrap();
+    ws.set_status(Status::Incomplete, "The project plan is not ready yet.").unwrap();
+    let mut h = harness(move || {
+        let mut app = demo::app(demo::engine(Mode::Beginner, true));
+        app.workspace = Some(ws);
+        app.state.feed = vec![FeedItem::Step { step: Step::Study, text: "The project plan is not ready yet.".into() }];
+        app.state.screen = Screen::Project;
+        app
+    });
+    h.run_steps(3);
+    h.get_by_label("Study: Stopped here");
+    assert!(h.query_by_label("Build: Done").is_none());
+    assert!(h.query_by_label("Check: Done").is_none());
+    assert!(h.query_by_label("Ready: Done").is_none());
+}
+
+#[test]
 fn a_finished_build_can_be_pinned_and_opened_from_the_sidebar() {
     use craft_anything_engine::workspace::{Status, TargetRef, Workspace};
     let d = tempfile::tempdir().unwrap();

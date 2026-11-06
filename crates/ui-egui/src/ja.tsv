@@ -1,5 +1,7 @@
 # 日本語 (Japanese). One `key<TAB>translation` per line; `#` starts a comment.
 # The key is the English string used in the code (i18n::tr); `\n` is a line break.
+Needs more work	追加の作業が必要
+There is work still to do. Continue builds on what is already there.	未完了の作業があります。続行すると、これまでの成果を基に作業を進めます。
 
  and {n} more	 ほか {n} 件
 (1 picture attached)	(画像 1 枚を添付)
@@ -881,3 +883,24 @@ Zoom	拡大/縮小
 Bring all to front	すべてを手前に移動
 Drag to give the plan more or less room; double-click to reset	ドラッグでプランの高さを変更、ダブルクリックで元に戻す
 Copy the message	メッセージをコピー
+Project plan	プロジェクト計画
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	{phases} フェーズ中 {implemented} を実装済み · {criteria} 条件中 {verified} を検証済み
+Pending	未着手
+In progress	進行中
+Implemented	実装済み
+Verified	検証済み
+Needs verification	検証が必要
+Required	必須
+Optional	任意
+Inputs and answers	必要な情報と回答
+Needed	必要
+Requested	依頼済み
+Provided	提供済み
+Deferred	保留
+Useful format: {format}	役立つ形式: {format}
+Needed for: {phases}	必要なフェーズ: {phases}
+Provide details	詳細を提供
+About "{question}":	「{question}」について:
+The project plan could not be read.	プロジェクト計画を読み取れませんでした。
+Update the build plan	ビルド計画を更新
+Keep the project phases, missing information and checks together in one plan.	プロジェクトのフェーズ、不足している情報、検証を一つの計画にまとめます。

@@ -7,6 +7,9 @@ mod note_progress;
 #[path = "stall_tests.rs"]
 mod stall;
 
+#[path = "planning_tests.rs"]
+mod planned;
+
 // Helpers that take a built-in kind's id, so each test reads as one line.
 fn kind(id: &str) -> Arc<dyn TargetKind> {
     KindRegistry::built_in().get(id).unwrap()
@@ -1313,6 +1316,7 @@ mod picking_up_a_build {
     }
 
     fn try_with(b: &Bench, ws: &Workspace, mut opts: RunOptions) -> (bool, Vec<feed::FeedItem>) {
+        completed_plan(ws);
         opts.kinds.register(Arc::new(FlakyKind));
         opts.backend = Some("Stand-in".into());
         let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), opts).unwrap();
@@ -1345,6 +1349,7 @@ mod picking_up_a_build {
         ws.save().unwrap();
         std::fs::create_dir_all(ws.capture_dir()).unwrap();
         std::fs::create_dir_all(ws.app_dir()).unwrap();
+        completed_plan(&ws);
         ws
     }
 
@@ -1444,6 +1449,20 @@ mod picking_up_a_build {
             assert!(!ok);
             assert_eq!(prompts_given(&b), expected);
         }
+    }
+
+    #[test]
+    fn an_exhausted_round_reports_incomplete_to_headless_clients() {
+        let b = bench();
+        let ws = worked_on(&b);
+        std::fs::write(ws.root.join("reject-build"), "not ready").unwrap();
+        let (ok, feed) = try_with(&b, &ws, RunOptions { max_rounds: 0, ..RunOptions::default() });
+        assert!(!ok, "the terminal event must not report success while work remains");
+        let saved = Workspace::open(&ws.root).unwrap();
+        assert_eq!(saved.manifest.status, Status::Incomplete);
+        assert!(saved.manifest.note.contains("The app is still missing."));
+        assert!(matches!(feed.last(), Some(feed::FeedItem::Step { step: Step::Check, .. })), "{feed:?}");
+        assert!(!feed.iter().any(|i| matches!(i, feed::FeedItem::Step { step: Step::Done, .. } | feed::FeedItem::Error { .. })), "{feed:?}");
     }
 
     #[test]
@@ -1868,6 +1887,7 @@ mod picking_up_a_build {
         ws.save().unwrap();
         std::fs::create_dir_all(ws.capture_dir()).unwrap();
         std::fs::create_dir_all(ws.app_dir()).unwrap();
+        completed_plan(&ws);
         // The stand-in answers "Done." and writes nothing, as the reported builder did.
         let opts = RunOptions { backend: Some("Stand-in".into()), ..RunOptions::default() };
         let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), opts).unwrap();
@@ -1906,6 +1926,54 @@ mod picking_up_a_build {
     }
 }
 
+/// Prepare the planning prerequisite for tests of unrelated runtime behavior. This observes only
+/// fixture setup: the app's success still depends on the checks exercised by each test.
+fn completed_plan(ws: &Workspace) {
+    use craft_anything_engine::build_plan::{AcceptanceCriterion, AcceptanceStatus, BUILD_PLAN_VERSION, BuildPhase, BuildPlan, PhaseStatus};
+    use craft_anything_engine::tools::investigation_tools::load_project_strict;
+    use craft_anything_evidence::{Confidence, Environment, EvidenceBuilder, Subject};
+
+    let root = ws.investigation_dir();
+    let mut investigation = load_project_strict(&root).unwrap();
+    if investigation.build_plan.is_some() {
+        return;
+    }
+    let project = Project::open(&root).or_else(|_| Project::create(&root, "Runtime fixture", Purpose::default())).unwrap();
+    assert!(ws.root.join("craft.json").is_file(), "the synthetic workspace manifest has been saved");
+    let evidence = EvidenceBuilder::new("test-fixture-setup", Subject { kind: "test".into(), sha256: None, name: None }, Environment::builtin(true))
+        .result(json!({"workspace_manifest_exists": true}))
+        .summary("The synthetic workspace manifest exists.")
+        .confidence(Confidence::Observed)
+        .build()
+        .unwrap();
+    project.store_evidence(&evidence).unwrap();
+    investigation.build_plan = Some(BuildPlan {
+        version: BUILD_PLAN_VERSION,
+        goal: "Exercise the prepared runtime fixture".into(),
+        phases: vec![BuildPhase {
+            id: "fixture".into(),
+            title: "Prepare isolated workspace".into(),
+            goal: "Save the synthetic workspace used by the runtime scenario".into(),
+            status: PhaseStatus::Done,
+            depends_on: Vec::new(),
+        }],
+        inputs: Vec::new(),
+        acceptance: vec![AcceptanceCriterion {
+            id: "prepared".into(),
+            phase_id: "fixture".into(),
+            description: "The synthetic workspace manifest exists".into(),
+            required: true,
+            status: AcceptanceStatus::Verified,
+            evidence_ids: vec![evidence.id],
+            checks: Vec::new(),
+        }],
+    });
+    investigation.revision += 1;
+    std::fs::create_dir_all(root.join("investigation")).unwrap();
+    std::fs::write(root.join("investigation/state.json"), serde_json::to_vec_pretty(&investigation).unwrap()).unwrap();
+    assert_eq!(load_project_strict(&root).unwrap(), investigation);
+}
+
 fn check_worker(ws: &Workspace, deep: bool) -> Worker {
     let mut s = craft_anything_engine::testing::session();
     s.settings.deep_mode = deep;
@@ -1927,6 +1995,49 @@ fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         self_check: None,
         reset_progress_after_notes: false,
     }
+}
+
+#[test]
+fn final_checks_keep_the_preview_without_declaring_the_work_done() {
+    use craft_anything_engine::workspace::Claim;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Draft", "A website", TargetRef::None).unwrap();
+    completed_plan(&ws);
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.app_dir().join("index.html"), "<h1>Draft</h1>").unwrap();
+    ws.manifest.checks = vec![CheckResult {
+        claims: vec![Claim::new("Drafts survive reopening", false, "The saved draft disappeared.")],
+        ..CheckResult::new(CheckResult::WEB_VISUAL, 1, true, "The site is served.")
+    }];
+    let mut worker = check_worker(&ws, false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    worker.tx = tx;
+    let preview = serve_dir(&ws.app_dir()).unwrap();
+    let url = preview.url();
+    *worker.preview.lock().unwrap() = Some(preview);
+    let summary = worker.finish_checks(&mut ws, 1, 90.0).unwrap();
+    assert!(summary.starts_with("Needs more work.") && summary.contains("The saved draft disappeared."), "{summary}");
+    assert_eq!(Workspace::open(&ws.root).unwrap().manifest.status, Status::Incomplete);
+    assert_eq!(worker.preview.lock().unwrap().as_ref().map(StaticServer::url), Some(url.clone()), "the preview is retained");
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(matches!(events.as_slice(), [RunEvent::Preview(found), RunEvent::Step { step: Step::Check, .. }] if found == &url), "{events:?}");
+
+    ws.manifest.checks.push(CheckResult::new(CheckResult::WEB_VISUAL, 2, true, "The site is served and the draft persists."));
+    worker.finish_checks(&mut ws, 2, 90.0).unwrap();
+    assert_eq!(ws.manifest.status, Status::Ready, "a later passing round supersedes the old failure");
+    assert!(rx.try_iter().any(|e| matches!(e, RunEvent::Step { step: Step::Done, .. })));
+}
+
+#[test]
+fn an_empty_final_check_round_does_not_become_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Draft", "An app", TargetRef::None).unwrap();
+    completed_plan(&ws);
+    ws.manifest.checks.push(CheckResult::new(CheckResult::BUILD, 1, true, "An earlier version built."));
+    let mut worker = check_worker(&ws, false);
+    let summary = worker.finish_checks(&mut ws, 2, 90.0).unwrap();
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+    assert!(summary.contains("No check results are available for this round."), "{summary}");
 }
 
 /// A kind with its checks after the first `.1`, so a test needn't build or start anything.
@@ -2377,8 +2488,9 @@ fn every_kind_leads_tests_its_own_build_and_keeps_its_unknowns() {
         let b = brief(&ws, k, false, false, None, false, None);
         assert!(b.contains("you lead the investigation") && b.contains("Don't repeat a call that already answered"), "{k}: {b}");
         assert!(b.contains("core_unknown_add") && b.contains("core_unknown_edit") && b.contains("Missing evidence is never proof"), "{k}");
-        assert!(b.contains("go through your checklist and core_unknowns_show"), "{k}");
-        assert!(b.contains("Test it against the original with rebuild_check") && b.contains("Before you reply, go through your checklist"), "{k}");
+        assert!(b.contains("Before you reply, read core_investigation_show and core_unknowns_show"), "{k}");
+        assert!(b.contains("Test it against the original with rebuild_check") && b.contains("core_build_plan_update"), "{k}");
+        assert!(b.contains("acceptance criteria") && b.contains("List missing inputs"), "{k}");
         if k == "website" {
             assert!(b.contains("Work from these pictures and measurements.\n\nMatch it exactly"), "one clean paragraph break: {b}");
             let deep = brief(&ws, k, true, false, None, false, None);

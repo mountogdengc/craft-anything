@@ -297,6 +297,11 @@
           "description": "Waiting for the person (a question, an approval, or after an error).",
           "type": "string",
           "const": "needs_you"
+        },
+        {
+          "description": "The run ended with work still to do. Any available preview can still be opened.",
+          "type": "string",
+          "const": "incomplete"
         }
       ]
     },

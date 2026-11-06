@@ -1,5 +1,7 @@
 # ko: Korean UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>Korean text. Keep placeholders and escapes intact.
+Needs more work	추가 작업 필요
+There is work still to do. Continue builds on what is already there.	아직 남은 작업이 있습니다. 계속하면 기존 결과를 바탕으로 작업합니다.
 OpenCode default	OpenCode 기본값
 Model default	모델 기본값
 Thinking depth	생각 깊이
@@ -1444,3 +1446,24 @@ Zoom	확대/축소
 Bring all to front	모두 앞으로 가져오기
 Drag to give the plan more or less room; double-click to reset	끌어서 계획이 차지하는 공간을 조절하고, 두 번 클릭하면 원래대로 돌아갑니다
 Copy the message	메시지 복사
+Project plan	프로젝트 계획
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	{phases}개 단계 중 {implemented}개 구현 · {criteria}개 기준 중 {verified}개 검증
+Pending	대기 중
+In progress	진행 중
+Implemented	구현됨
+Verified	검증됨
+Needs verification	검증 필요
+Required	필수
+Optional	선택 사항
+Inputs and answers	필요한 정보와 답변
+Needed	필요함
+Requested	요청됨
+Provided	제공됨
+Deferred	보류됨
+Useful format: {format}	유용한 형식: {format}
+Needed for: {phases}	필요한 단계: {phases}
+Provide details	세부 정보 제공
+About "{question}":	"{question}"에 관해:
+The project plan could not be read.	프로젝트 계획을 읽을 수 없습니다.
+Update the build plan	빌드 계획 업데이트
+Keep the project phases, missing information and checks together in one plan.	프로젝트 단계, 부족한 정보, 검사를 하나의 계획에 모아 둡니다.

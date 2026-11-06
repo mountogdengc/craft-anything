@@ -7,7 +7,7 @@ use craft_anything_engines::assets::{Catalogue, Shape, about_usd};
 pub(super) const RULES: &str = "\
 Rules:
 - Their request comes first. When it says how to build (a language, framework, engine, library or platform), build with exactly that, even where these instructions name something else: the stack given here is only the default for what the request leaves open. Don't switch away from what they asked for to get past a failing build or check; fix the build instead.
-- Change files only inside app/. Everything else in the workspace is read-only evidence.
+- Change application files only inside app/. Use the Craft Anything planning and evidence tools to update their own records; never edit those records directly.
 - Rebuild the layout, styling and behaviour yourself from the evidence. Don't copy logos, photos, brand names or long passages of text unless the person confirms they own the original or have permission (ask once with core_person_ask if it matters); otherwise use neutral placeholders: simple shapes or gradients for images, short sample copy for text.
 - Use the core_person_ask tool (craft-anything MCP server) only for choices that really change the result. Give 2-4 short choices. Never ask about technical details you can decide yourself.
 - Build what the person asked for. If part of it won't fit this version (for example online co-op, a whole game mode or another platform), ask with core_person_ask before leaving it out, with the smaller version as one of the choices; never drop it silently.
@@ -27,12 +27,16 @@ pub(super) fn steps(deep: bool) -> String {
     format!(
         "How to work: you lead the investigation and the craft-anything tools answer your questions with evidence.
 1) Study the evidence, overview first (the README and summaries before the details). Where it leaves a gap that matters to the result, ask a focused follow-up with the craft-anything tools instead of guessing: {follow_up} Don't repeat a call that already answered. Record each question the evidence doesn't answer yet with core_unknown_add (the question, what would settle it as probes, and how much it matters as severity), and when a later look answers it, close it with core_unknown_edit (status resolved, the resolution and the evidence ids that settle it); until then say in it what you did instead (an estimate, a placeholder or a question for the person). Missing evidence is never proof, so mark what you estimated.
-2) Make a short checklist with TodoWrite: 3-7 steps in plain words the person can follow (no file names or jargon), each with a short activeForm such as \"Drawing the map\"; the person watches it live, so keep it updated as you go.
-3) Build it in app/ and fix errors until the build succeeds.
-4) Test it against the original with rebuild_check: it runs the same checks Craft Anything runs after your turn and lists what differs and what couldn't be compared. Fix those, build and check again until it says it would pass.
-5) Before you reply, go through your checklist and core_unknowns_show once more: settle what one more look can settle, and say what's left in your summary."
+2) {BUILD_PLANNING}
+3) Build the next unblocked phase in app/ and fix errors until the build succeeds. Keep its phase and acceptance status current through core_build_plan_update. A phase marked done is an implementation report, not proof that its behavior works.
+4) Test it against the original with rebuild_check: it runs the same checks Craft Anything runs after your turn and lists what differs and what couldn't be compared. Also exercise the acceptance criteria: for an app, follow the requested interactions, navigate directly to nested views, and reopen saved or unfinished work where relevant. A build succeeding, a screenshot, or a link existing does not prove those behaviors. Record verified criteria only with evidence or exact check references returned by real tools. Fix failures, build and check again; keep untested criteria pending or implemented.
+5) Before you reply, read core_investigation_show and core_unknowns_show once more. Update the durable plan with what is implemented, what has actually been verified, and the inputs or checks still needed. Preserve the original scope and unfinished requirements across turns. Settle what one more look can settle, and say what's left in your summary."
     )
 }
+
+/// One durable product plan, shared by every builder and the project screen. A provider's
+/// temporary todo list must not replace the requested scope or count as verification.
+pub(super) const BUILD_PLANNING: &str = "Before changing application files, read core_investigation_show, then create or revise its build_plan with core_build_plan_update passing its returned revision as based_on_revision. Keep the person's overall goal and all requested capabilities, with stable phase and criterion IDs across updates. Use a few concrete phases, each with its goal and dependencies, and acceptance criteria that describe observable results. For sites and apps, cover the requested subpages, meaningful screen states, navigation, data changes and persistence, not just the start page's appearance. List missing inputs in the plan: the question, why it matters, the useful format (such as screenshots of an authenticated flow, an example file, or a rules explanation), which phases need it, and whether it is required. Reuse supplied material before asking again. Ask the person with core_person_ask only when a missing answer materially changes the result, respecting their question preference; record an answer or a clearly described assumption. Keep genuinely unavailable required inputs unresolved and continue independent phases. Optional inputs must not stop unrelated work. Do not silently remove requirements to make the plan look complete. This durable plan is what the person sees; keep it current instead of maintaining a separate product checklist.";
 
 /// What the builder is told for the stack (from `stacks.toml`).
 pub(super) fn stack_steps(stack: &str, editor: Option<&Path>) -> String {
@@ -287,7 +291,7 @@ pub(super) fn pictures_reminder(ws: &Workspace) -> String {
 pub(super) fn added_prompt(notes: &[String]) -> String {
     let list = notes.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n");
     format!(
-        "While you were working, the person added:\n{list}\n\nTake this into account now: change app/ as needed, build again and fix any errors. Reply with 1-3 plain sentences on what you changed."
+        "While you were working, the person added:\n{list}\n\nTake this into account now. {BUILD_PLANNING}\n\nChange app/ as needed, build again and fix any errors. Reply with 1-3 plain sentences on what you changed and what remains unverified."
     )
 }
 
@@ -296,7 +300,7 @@ pub(super) fn added_prompt(notes: &[String]) -> String {
 pub(super) fn continue_prompt(kind: &dyn TargetKind) -> String {
     let build = kind.rebuild_words();
     format!(
-        "Your last run stopped before it finished (it was paused, or the app or the computer stopped). Everything you made so far is in app/. Pick up where you left off: see what's done and what's left (your checklist and core_unknowns_show), finish the task, then {build}, fix any errors and check it with rebuild_check. Reply with 1-3 plain sentences on what you did."
+        "Your last run stopped before it finished (it was paused, or the app or the computer stopped). Everything you made so far is in app/. {BUILD_PLANNING}\n\nPick up where you left off: see what's done and what's left (core_investigation_show and core_unknowns_show), finish the next unblocked phase, then {build}, fix any errors and check it with rebuild_check. Reply with 1-3 plain sentences on what you did and what remains unverified."
     )
 }
 
@@ -325,6 +329,6 @@ pub(super) fn resumed_elsewhere(brief: &str, last_reply: &str, handoff: Option<&
 pub(super) fn follow_up(message: &str, kind: &dyn TargetKind) -> String {
     let build = kind.rebuild_words();
     format!(
-        "The person asks: \"{message}\"\n\nMake the change in app/, then {build}, fix any errors and check it with rebuild_check. Reply with 1-3 plain sentences on what changed."
+        "The person asks: \"{message}\"\n\n{BUILD_PLANNING}\n\nMake the change in app/, then {build}, fix any errors and check it with rebuild_check. Recheck the affected acceptance criteria before marking them verified. Reply with 1-3 plain sentences on what changed and what remains unverified."
     )
 }

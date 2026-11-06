@@ -6,16 +6,18 @@
 //! Any agent (ours or an external one over MCP) keeps them current so long investigations survive
 //! context limits, restarts and handoffs between agents.
 
+use crate::build_plan::{AcceptanceStatus, BuildPlan};
 use crate::journal;
 use crate::project::write_atomic;
 use crate::session::Session;
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, empty_schema, parse_params, schema_of};
-use craft_anything_evidence::{Confidence, ErrorCode, ToolError};
+use craft_anything_evidence::{Confidence, ErrorCode, Evidence, ToolError};
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -54,6 +56,17 @@ pub fn specs() -> Vec<ToolSpec> {
             requires: Requires::Nothing,
             input_schema: schema_of::<PlanParams>,
             run: core_plan_update,
+        },
+        ToolSpec {
+            id: "core_build_plan_update",
+            title: "Update the build plan",
+            summary: "Save the build's goal, phases and dependencies, required or optional inputs, and acceptance criteria in the investigation. Read core_investigation_show first and pass its revision as based_on_revision. Retain all phases. Required inputs and criteria must remain required; keep required criteria in their original phase. A done phase is implementation progress; verified acceptance must cite real evidence from the built project or current recorded checks. Ask for missing inputs with core_person_ask when needed; recording an input does not send a question.",
+            beginner: "Keep the project phases, missing information and checks together in one plan.",
+            toolset: Toolset::Core,
+            effects: w,
+            requires: Requires::Nothing,
+            input_schema: schema_of::<BuildPlanParams>,
+            run: core_build_plan_update,
         },
         ToolSpec {
             id: "core_hypothesis_record",
@@ -168,7 +181,7 @@ pub enum HypothesisStatus {
     Abandoned,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Hypothesis {
     pub id: String,
     pub claim: String,
@@ -183,21 +196,32 @@ pub struct Hypothesis {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Finding {
     pub id: String,
     pub statement: String,
     pub evidence_ids: Vec<String>,
+    #[schemars(with = "ConfidenceParam")]
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub const INVESTIGATION_VERSION: u32 = 1;
+const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+const INVESTIGATION_STEPS: &[crate::versioned::Step<Value>] = &[investigation_v0_to_v1];
+const _: () = assert!(INVESTIGATION_STEPS.len() == INVESTIGATION_VERSION as usize);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Investigation {
+    #[serde(default = "investigation_version")]
+    pub version: u32,
     pub revision: u64,
     #[serde(default)]
     pub brief: Option<Brief>,
     #[serde(default)]
     pub plan: Vec<PlanStep>,
+    /// Canonical project scope and progress. The older plan remains an analysis checklist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_plan: Option<BuildPlan>,
     #[serde(default)]
     pub hypotheses: Vec<Hypothesis>,
     #[serde(default)]
@@ -206,6 +230,86 @@ pub struct Investigation {
     pub handoff: Option<String>,
     #[serde(default)]
     pub updated: Option<String>,
+}
+
+fn investigation_version() -> u32 {
+    INVESTIGATION_VERSION
+}
+
+impl Default for Investigation {
+    fn default() -> Self {
+        Self {
+            version: INVESTIGATION_VERSION,
+            revision: 0,
+            brief: None,
+            plan: Vec::new(),
+            build_plan: None,
+            hypotheses: Vec::new(),
+            findings: Vec::new(),
+            handoff: None,
+            updated: None,
+        }
+    }
+}
+
+fn investigation_v0_to_v1(document: &mut Value) -> Result<(), String> {
+    if document.is_object() { Ok(()) } else { Err("the investigation is not a JSON object".into()) }
+}
+
+fn state_error(reason: impl std::fmt::Display) -> ToolError {
+    ToolError::new(ErrorCode::GarbledOutput, format!("The investigation state could not be read; it was not changed. {reason}"))
+        .with_remediation("Restore a valid investigation/state.json backup before editing this investigation.")
+}
+
+fn state_too_large() -> ToolError {
+    ToolError::new(ErrorCode::OverLimit, "The investigation state exceeds the 32 MiB limit; it was not changed.")
+        .with_remediation("Keep a backup, then shorten the investigation notes before retrying.")
+}
+
+fn validate_state(investigation: &Investigation) -> Result<(), ToolError> {
+    if investigation.version != INVESTIGATION_VERSION {
+        return Err(ToolError::unsupported(format!(
+            "Investigation version {} is not supported; this build reads version {INVESTIGATION_VERSION}.",
+            investigation.version
+        ))
+        .with_remediation("Update Craft Anything before reading or changing this investigation."));
+    }
+    if let Some(plan) = &investigation.build_plan {
+        plan.validate()?;
+    }
+    Ok(())
+}
+
+/// Parse legacy unversioned state in memory. Saving writes the current version; unreadable or
+/// future state is never replaced by an empty investigation on this strict path.
+pub fn read_investigation(bytes: &[u8]) -> Result<Investigation, ToolError> {
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(state_too_large());
+    }
+    let mut document: Value = serde_json::from_slice(bytes).map_err(state_error)?;
+    let found = match document.get("version") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| state_error("The version must be a whole number."))?,
+    };
+    if found > INVESTIGATION_VERSION {
+        return Err(ToolError::unsupported(format!(
+            "This investigation needs a newer Craft Anything (version {found}; this build reads {INVESTIGATION_VERSION})."
+        ))
+        .with_remediation("Update Craft Anything before reading or changing this investigation."));
+    }
+    let reached = crate::versioned::upgrade(&mut document, found, 0, INVESTIGATION_STEPS).map_err(state_error)?;
+    if let Some(object) = document.as_object_mut() {
+        object.insert("version".into(), Value::from(reached));
+    }
+    let investigation: Investigation = serde_json::from_value(document).map_err(state_error)?;
+    validate_state(&investigation)?;
+    Ok(investigation)
+}
+
+/// The schema of the canonical investigation state, including its optional build plan.
+pub fn investigation_schema() -> String {
+    let schema = schemars::generate::SchemaSettings::draft2020_12().into_generator().into_root_schema_for::<Investigation>();
+    serde_json::to_string_pretty(&schema).map(|s| s + "\n").unwrap_or_default()
 }
 
 type Slot = Mutex<Investigation>;
@@ -229,10 +333,62 @@ fn dir(session: &Session) -> Option<PathBuf> {
 
 /// The current investigation state (from the project when one is open, else the session).
 pub fn load(session: &Session) -> Investigation {
-    if let Some(d) = dir(session) {
-        return std::fs::read(d.join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    load_strict(session).unwrap_or_default()
+}
+
+/// Use for completion decisions: missing state is a new investigation, while invalid
+/// state is an error. The lenient legacy `load` is only suitable for optional display snapshots.
+pub fn load_strict(session: &Session) -> Result<Investigation, ToolError> {
+    if let Some(project) = &session.project {
+        return load_project_strict(&project.root);
     }
-    session.ext.get::<Slot>().map(|s| s.lock().unwrap_or_else(PoisonError::into_inner).clone()).unwrap_or_default()
+    let investigation = load_state(session)?;
+    if let Some(plan) = &investigation.build_plan {
+        validate_plan_evidence(plan, |id| session.resolve_evidence(id))?;
+    }
+    Ok(investigation)
+}
+
+/// Read from a `.cany` project root, not a rebuild workspace root. Call off the UI thread.
+pub fn load_project_strict(project_root: &Path) -> Result<Investigation, ToolError> {
+    let investigation = load_project_state(project_root)?;
+    if let Some(plan) = &investigation.build_plan
+        && (plan.inputs.iter().any(|input| !input.evidence_ids.is_empty()) || plan.acceptance.iter().any(|criterion| !criterion.evidence_ids.is_empty()))
+    {
+        let project = crate::project::Project::open(project_root)?;
+        validate_plan_evidence(plan, |id| project.load_evidence(id))?;
+    }
+    Ok(investigation)
+}
+
+/// Structurally valid state for inspection and repair. Completion must use `load_strict`, which
+/// additionally resolves recorded evidence; an inspection can show a stale citation to fix it.
+pub fn load_state(session: &Session) -> Result<Investigation, ToolError> {
+    if let Some(project) = &session.project {
+        return load_project_state(&project.root);
+    }
+    let investigation = cached(session);
+    validate_state(&investigation)?;
+    Ok(investigation)
+}
+
+/// Read structurally valid state from a `.cany` root without treating citations as verified.
+/// Use `load_project_strict` before deciding completion. Call off the UI thread.
+pub fn load_project_state(project_root: &Path) -> Result<Investigation, ToolError> {
+    load_directory_strict(&project_root.join("investigation"))
+}
+
+fn load_directory_strict(directory: &Path) -> Result<Investigation, ToolError> {
+    let path = directory.join("state.json");
+    match std::fs::File::open(&path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(MAX_STATE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|error| ToolError::io(path.display(), error))?;
+            read_investigation(&bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Investigation::default()),
+        Err(error) => Err(ToolError::io(path.display(), error)),
+    }
 }
 
 struct UpdateLock {
@@ -275,16 +431,8 @@ fn lock_update(session: &Session, cancel: &crate::CancelToken) -> Result<UpdateL
 }
 
 fn load_for_update(session: &Session, guard: &UpdateLock) -> Result<Investigation, ToolError> {
-    let Some(directory) = &guard.directory else { return Ok(load(session)) };
-    let path = directory.join("state.json");
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-            ToolError::new(ErrorCode::GarbledOutput, "The investigation state could not be read; it was not changed.")
-                .with_remediation("Restore a valid investigation/state.json backup before editing this investigation.")
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Investigation::default()),
-        Err(error) => Err(ToolError::io(path.display(), error)),
-    }
+    let Some(directory) = &guard.directory else { return load_state(session) };
+    load_directory_strict(directory)
 }
 
 pub(crate) fn save_new_project(session: &mut Session, inv: Investigation) -> Result<Investigation, ToolError> {
@@ -303,11 +451,15 @@ fn save(session: &mut Session, mut inv: Investigation, guard: &UpdateLock) -> Re
     if guard.directory != dir(session) {
         return Err(ToolError::internal("The investigation changed while its update lock was held."));
     }
+    validate_state(&inv)?;
     inv.revision = inv.revision.saturating_add(1);
     let (_, date, time) = journal::now_utc();
     inv.updated = Some(format!("{date}T{time}Z"));
     if let Some(d) = dir(session) {
         let text = serde_json::to_vec_pretty(&inv).map_err(|e| ToolError::internal(e.to_string()))?;
+        if text.len() > MAX_STATE_BYTES {
+            return Err(state_too_large());
+        }
         write_atomic(&d.join("state.json"), &text)?;
         for (name, body) in render(&inv) {
             write_atomic(&d.join(name), body.as_bytes())?;
@@ -363,6 +515,64 @@ pub fn render(inv: &Investigation) -> Vec<(&'static str, String)> {
         }
         plan.push('\n');
     }
+    if let Some(build) = &inv.build_plan {
+        let analysis_plan = plan;
+        plan = format!("# Build plan\n\n{}\n\n## Phases\n\n", build.goal);
+        for phase in &build.phases {
+            plan.push_str(&format!("### {} — {} ({:?})\n\n{}\n\n", phase.id, phase.title, phase.status, phase.goal));
+            if !phase.depends_on.is_empty() {
+                plan.push_str(&format!("Depends on: {}\n\n", phase.depends_on.join(", ")));
+            }
+        }
+        plan.push_str("## Inputs\n\n");
+        if build.inputs.is_empty() {
+            plan.push_str("_No missing inputs recorded._\n\n");
+        }
+        for input in &build.inputs {
+            plan.push_str(&format!(
+                "### {} ({}, {:?})\n\n{}\n\nWhy: {}\n\nExpected format: {}\n\nPhases: {}\n\n",
+                input.id,
+                if input.required { "required" } else { "optional" },
+                input.status,
+                input.question,
+                input.why,
+                input.format,
+                input.phase_ids.join(", ")
+            ));
+            if let Some(response) = &input.response {
+                plan.push_str(&format!("Response: {response}\n\n"));
+            }
+            if !input.evidence_ids.is_empty() {
+                plan.push_str(&format!("Evidence: {}\n\n", input.evidence_ids.join(", ")));
+            }
+        }
+        plan.push_str("## Acceptance criteria\n\nRecorded verification cites evidence or check results; a done phase alone is not verification.\n\n");
+        for criterion in &build.acceptance {
+            plan.push_str(&format!(
+                "- **{}** ({}, {:?}; phase {}) {}\n",
+                criterion.id,
+                if criterion.required { "required" } else { "optional" },
+                criterion.status,
+                criterion.phase_id,
+                criterion.description
+            ));
+            if !criterion.evidence_ids.is_empty() {
+                plan.push_str(&format!("  Evidence: {}\n", criterion.evidence_ids.join(", ")));
+            }
+            for check in &criterion.checks {
+                plan.push_str(&format!(
+                    "  Check: {}, round {}{}\n",
+                    check.check,
+                    check.round,
+                    check.claim.as_ref().map(|claim| format!(", claim {claim}")).unwrap_or_default()
+                ));
+            }
+        }
+        if !inv.plan.is_empty() {
+            plan.push_str("\n## Investigation checklist\n\n");
+            plan.push_str(analysis_plan.strip_prefix("# Plan\n\n").unwrap_or(&analysis_plan));
+        }
+    }
     let mut hyp = String::from("# Hypotheses\n\n");
     if inv.hypotheses.is_empty() {
         hyp.push_str("_None yet._\n");
@@ -394,11 +604,22 @@ pub fn render(inv: &Investigation) -> Vec<(&'static str, String)> {
 }
 
 fn out(inv: &Investigation, session: &Session) -> ToolOutput {
+    let verification_issue = inv.build_plan.as_ref().and_then(|plan| {
+        validate_plan_evidence(plan, |id| match &session.project {
+            Some(project) => project.load_evidence(id),
+            None => session.resolve_evidence(id),
+        })
+        .err()
+        .map(|error| error.message)
+    });
     ToolOutput::Value(json!({
+        "version": inv.version,
         "revision": inv.revision,
         "updated": inv.updated,
         "brief": inv.brief,
         "plan": inv.plan,
+        "build_plan": inv.build_plan,
+        "build_plan_verification_issue": verification_issue,
         "hypotheses": inv.hypotheses,
         "findings": inv.findings,
         "handoff": inv.handoff,
@@ -415,6 +636,23 @@ fn check_ids(session: &Session, ids: &[String]) -> Result<(), ToolError> {
     Ok(())
 }
 
+fn validate_plan_evidence(plan: &BuildPlan, mut resolve: impl FnMut(&str) -> Result<Evidence, ToolError>) -> Result<(), ToolError> {
+    for input in &plan.inputs {
+        for id in &input.evidence_ids {
+            resolve(id)?;
+        }
+    }
+    for criterion in &plan.acceptance {
+        for id in &criterion.evidence_ids {
+            let evidence = resolve(id)?;
+            if criterion.status == AcceptanceStatus::Verified && evidence.confidence == Confidence::Inferred {
+                return Err(ToolError::invalid(format!("Acceptance criterion {} needs observed or derived evidence; {id} is inferred.", criterion.id)));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_revision(inv: &Investigation, expected: Option<u64>) -> Result<(), ToolError> {
     match expected {
         Some(r) if r != inv.revision => Err(ToolError::new(ErrorCode::StaleRevision, format!("The investigation is at revision {}, not {r}.", inv.revision))
@@ -426,7 +664,7 @@ fn check_revision(inv: &Investigation, expected: Option<u64>) -> Result<(), Tool
 // ---- tools ----
 
 fn core_investigation_show(ctx: &mut Ctx<'_>, _p: Value) -> Result<ToolOutput, ToolError> {
-    let inv = load(ctx.session);
+    let inv = load_state(ctx.session)?;
     Ok(out(&inv, ctx.session))
 }
 
@@ -482,6 +720,42 @@ fn core_plan_update(ctx: &mut Ctx<'_>, p: Value) -> Result<ToolOutput, ToolError
     inv.plan = p.steps;
     let inv = save(ctx.session, inv, &guard)?;
     Ok(out(&inv, ctx.session))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildPlanParams {
+    /// The whole build plan. Preserve existing ids and requirements while updating progress.
+    pub plan: BuildPlan,
+    /// Required revision from core_investigation_show; stale updates are refused.
+    pub based_on_revision: u64,
+}
+
+fn core_build_plan_update(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let params: BuildPlanParams = parse_params(params)?;
+    params.plan.validate()?;
+    let guard = lock_update(ctx.session, &ctx.cancel)?;
+    let mut investigation = load_for_update(ctx.session, &guard)?;
+    check_revision(&investigation, Some(params.based_on_revision))?;
+    if let Some(previous) = &investigation.build_plan {
+        params.plan.validate_scope_update(previous)?;
+    }
+    validate_plan_evidence(&params.plan, |id| ctx.session.resolve_evidence(id))?;
+    let workspace = super::interaction_tools::inbox(ctx).as_ref().and_then(super::interaction_tools::workspace_of);
+    for criterion in &params.plan.acceptance {
+        for reference in &criterion.checks {
+            let workspace = workspace.as_ref().ok_or_else(|| {
+                ToolError::unavailable("Check citations need the build workspace that recorded them.")
+                    .with_remediation("Use the build plan tool from the project's attached builder, or cite recorded evidence instead.")
+            })?;
+            // The run's fallback likeness threshold is not stored here. Validate the recorded
+            // success and its own threshold now; completion also applies the run's threshold.
+            reference.verify(&workspace.manifest.checks, 0.0)?;
+        }
+    }
+    investigation.build_plan = Some(params.plan);
+    let investigation = save(ctx.session, investigation, &guard)?;
+    Ok(out(&investigation, ctx.session))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -728,6 +1002,191 @@ mod tests {
         e.call(id, p, CallOptions::new(Caller::Agent)).map(|o| o.to_json())
     }
 
+    fn build_plan(goal: &str) -> serde_json::Value {
+        json!({
+            "goal":goal,
+            "phases":[{"id":"catalogue","title":"Catalogue","goal":"Store and reopen entries"}],
+            "inputs":[{"id":"sample","question":"Which sample record?","why":"Defines the fields","format":"One record","phase_ids":["catalogue"]}],
+            "acceptance":[{"id":"reload","phase_id":"catalogue","description":"Saved entries survive reopening"}]
+        })
+    }
+
+    #[test]
+    fn build_plan_survives_resuming_and_other_investigation_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = Project::create(&directory.path().join("project.cany"), "Test", Purpose::Education).unwrap();
+        let root = project.root.clone();
+        let mut session = crate::Session::isolated(&directory.path().join("config"));
+        session.settings.deep_mode = false;
+        session.open_project(project).unwrap();
+        let engine = Engine::new(session);
+        let mut plan = build_plan("Build a catalogue");
+        plan["inputs"][0]["status"] = json!("provided");
+        plan["inputs"][0]["response"] = json!("Use the synthetic record.");
+        let update = json!({"plan":plan,"based_on_revision":0});
+        let saved = call(&engine, "core_build_plan_update", update.clone()).unwrap();
+        assert_eq!(saved["result"]["revision"], 1);
+        assert_eq!(call(&engine, "core_build_plan_update", update).unwrap_err().code, craft_anything_evidence::ErrorCode::StaleRevision);
+        call(&engine, "core_plan_update", json!({"steps":[{"title":"Study the visible form"}],"based_on_revision":1})).unwrap();
+        call(&engine, "core_handoff_write", json!({"text":"Next: implement persistence."})).unwrap();
+        let mut resumed = crate::Session::isolated(&directory.path().join("resumed-config"));
+        resumed.open_project(Project::open(&root).unwrap()).unwrap();
+        let investigation = super::load_strict(&resumed).unwrap();
+        assert_eq!(investigation.version, super::INVESTIGATION_VERSION);
+        assert_eq!(investigation.revision, 3);
+        let build = investigation.build_plan.as_ref().unwrap();
+        assert!(build.inputs[0].provided());
+        assert_eq!(build.phases[0].status, crate::build_plan::PhaseStatus::Todo);
+        assert_eq!(build.acceptance[0].status, crate::build_plan::AcceptanceStatus::Pending);
+        assert_eq!(super::cached(&resumed), investigation);
+        assert_eq!(super::load_project_strict(&root).unwrap(), investigation);
+        let rendered = std::fs::read_to_string(root.join("investigation/plan.md")).unwrap();
+        assert!(rendered.contains("# Build plan"));
+        assert!(rendered.contains("Which sample record?") && rendered.contains("Saved entries survive reopening"));
+        assert!(rendered.contains("Study the visible form"));
+        assert_eq!(super::render(&investigation).into_iter().find(|(name, _)| *name == "plan.md").unwrap().1, rendered);
+    }
+
+    #[test]
+    fn build_plan_verification_requires_existing_non_inferred_evidence() {
+        use craft_anything_evidence::{Confidence, Environment, EvidenceBuilder, Subject};
+        let engine = Engine::new(crate::testing::session());
+        let mut plan = build_plan("Build a catalogue");
+        plan["acceptance"][0]["status"] = json!("verified");
+        let before = call(&engine, "core_investigation_show", json!({})).unwrap();
+        assert!(call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":0})).is_err());
+        plan["acceptance"][0]["evidence_ids"] = json!([format!("ev_{}", "0".repeat(64))]);
+        assert!(call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":0})).is_err());
+        assert_eq!(call(&engine, "core_investigation_show", json!({})).unwrap(), before);
+        for (confidence, accepted) in [(Confidence::Inferred, false), (Confidence::Observed, true)] {
+            let evidence = EvidenceBuilder::new("test-reload", Subject { kind: "test".into(), sha256: None, name: None }, Environment::builtin(true))
+                .result(json!({"entries_after_reload":1}))
+                .summary("Synthetic reload observation")
+                .confidence(confidence)
+                .build()
+                .unwrap();
+            let id = evidence.id.clone();
+            engine.session().record(evidence).unwrap();
+            plan["acceptance"][0]["evidence_ids"] = json!([id]);
+            assert_eq!(call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":0})).is_ok(), accepted);
+        }
+        assert_eq!(super::cached(&engine.session()).revision, 1);
+    }
+
+    #[test]
+    fn build_plan_updates_cannot_drop_or_demote_required_scope() {
+        let engine = Engine::new(crate::testing::session());
+        let mut plan = build_plan("Build a catalogue");
+        let mut optional_input = plan["inputs"][0].clone();
+        optional_input["id"] = json!("art");
+        optional_input["required"] = json!(false);
+        plan["inputs"].as_array_mut().unwrap().push(optional_input);
+        let mut optional_criterion = plan["acceptance"][0].clone();
+        optional_criterion["id"] = json!("polish");
+        optional_criterion["required"] = json!(false);
+        plan["acceptance"].as_array_mut().unwrap().push(optional_criterion.clone());
+        call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":0})).unwrap();
+        let before = call(&engine, "core_investigation_show", json!({})).unwrap();
+        let mut omitted_input = plan.clone();
+        omitted_input["inputs"] = json!([]);
+        let mut demoted_input = plan.clone();
+        demoted_input["inputs"][0]["required"] = json!(false);
+        let mut omitted_criterion = plan.clone();
+        omitted_criterion["acceptance"] = json!([optional_criterion]);
+        let mut demoted_criterion = plan.clone();
+        demoted_criterion["acceptance"][0]["required"] = json!(false);
+        let mut moved_criterion = plan.clone();
+        moved_criterion["acceptance"][0]["phase_id"] = json!("other");
+        moved_criterion["phases"].as_array_mut().unwrap().push(json!({"id":"other","title":"Other","goal":"Another phase"}));
+        for invalid in [omitted_input, demoted_input, omitted_criterion, demoted_criterion, moved_criterion] {
+            assert!(call(&engine, "core_build_plan_update", json!({"plan":invalid,"based_on_revision":1})).is_err());
+            assert_eq!(call(&engine, "core_investigation_show", json!({})).unwrap(), before);
+        }
+        plan["inputs"].as_array_mut().unwrap().retain(|input| input["required"] != false);
+        plan["acceptance"].as_array_mut().unwrap().retain(|criterion| criterion["required"] != false);
+        plan["inputs"][0]["status"] = json!("provided");
+        plan["inputs"][0]["response"] = json!("Use the synthetic record.");
+        plan["acceptance"][0]["status"] = json!("implemented");
+        plan["acceptance"][0]["description"] = json!("Stored entries remain after reopening the app.");
+        let saved = call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":1})).unwrap();
+        assert_eq!(saved["result"]["revision"], 2);
+        assert_eq!(saved["result"]["build_plan"]["inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["result"]["build_plan"]["acceptance"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_plan_check_citations_are_resolved_against_the_attached_workspace() {
+        use crate::workspace::{CheckResult, Claim, TargetRef, Workspace};
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::create(directory.path(), "Catalogue", "Store records", TargetRef::None).unwrap();
+        let mut session = crate::Session::isolated(&directory.path().join("config"));
+        session.ext.insert(std::sync::Arc::new(crate::inbox::InboxDir(workspace.inbox_dir())));
+        let engine = Engine::new(session);
+        let mut plan = build_plan("Build a catalogue");
+        plan["acceptance"][0]["status"] = json!("verified");
+        plan["acceptance"][0]["checks"] = json!([{"check":"persistence","round":1,"claim":"Saved entries survive reopening"}]);
+        assert!(call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":0})).is_err());
+        let passed = CheckResult {
+            claims: vec![Claim::new("Saved entries survive reopening", true, "")],
+            ..CheckResult::new("persistence", 1, true, "One stored record returned.")
+        };
+        workspace.manifest.checks.push(passed.clone());
+        workspace.save().unwrap();
+        assert!(call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":0})).is_ok());
+        workspace.manifest.checks.push(CheckResult { round: 2, ..passed.clone() });
+        workspace.save().unwrap();
+        assert!(
+            call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":1})).is_ok(),
+            "same check passing again revalidates its citation"
+        );
+        workspace.manifest.checks.push(CheckResult { round: 3, passed: false, ..passed });
+        workspace.save().unwrap();
+        assert!(call(&engine, "core_build_plan_update", json!({"plan":plan,"based_on_revision":2})).is_err());
+        assert_eq!(super::cached(&engine.session()).revision, 2);
+    }
+
+    #[test]
+    fn legacy_investigation_migrates_and_invalid_or_future_state_never_becomes_empty() {
+        let legacy = br#"{"revision":7,"plan":[{"title":"Keep the old plan","status":"doing"}],"handoff":"Keep going"}"#;
+        let migrated = super::read_investigation(legacy).unwrap();
+        assert_eq!(migrated.version, super::INVESTIGATION_VERSION);
+        assert_eq!(migrated.revision, 7);
+        assert_eq!(migrated.plan[0].title, "Keep the old plan");
+        assert!(migrated.build_plan.is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let project = Project::create(&directory.path().join("project.cany"), "Test", Purpose::Education).unwrap();
+        let root = project.root.clone();
+        let mut session = crate::Session::isolated(&directory.path().join("config"));
+        session.open_project(project).unwrap();
+        let engine = Engine::new(session);
+        let path = root.join("investigation/state.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut invalid = json!({"version":1,"revision":7,"build_plan":build_plan("Catalogue")});
+        invalid["build_plan"]["inputs"][0]["phase_ids"] = json!(["missing"]);
+        for bytes in [b"not-json".to_vec(), br#"{"version":999,"revision":7}"#.to_vec(), serde_json::to_vec(&invalid).unwrap()] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(super::load_project_strict(&root).is_err());
+            assert!(call(&engine, "core_investigation_show", json!({})).is_err());
+            assert!(call(&engine, "core_build_plan_update", json!({"plan":build_plan("Replacement"),"based_on_revision":7})).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        let mut missing_evidence = json!({"version":1,"revision":7,"build_plan":build_plan("Catalogue")});
+        missing_evidence["build_plan"]["acceptance"][0]["status"] = json!("verified");
+        missing_evidence["build_plan"]["acceptance"][0]["evidence_ids"] = json!([format!("ev_{}", "0".repeat(64))]);
+        std::fs::write(&path, serde_json::to_vec(&missing_evidence).unwrap()).unwrap();
+        assert!(super::load_project_strict(&root).is_err(), "valid-looking citations must also exist");
+        assert!(super::load_project_state(&root).is_ok(), "inspection must retain the plan so its citation can be repaired");
+        let inspection = call(&engine, "core_investigation_show", json!({})).unwrap();
+        assert_eq!(inspection["result"]["revision"], 7);
+        assert!(inspection["result"]["build_plan_verification_issue"].as_str().is_some());
+        call(&engine, "core_build_plan_update", json!({"plan":build_plan("Catalogue"),"based_on_revision":7})).unwrap();
+        assert!(super::load_project_strict(&root).is_ok(), "a revision-aware update can remove an invalid citation without discarding the plan");
+        std::fs::File::create(&path).unwrap().set_len(super::MAX_STATE_BYTES as u64 + 1).unwrap();
+        assert_eq!(super::load_project_strict(&root).unwrap_err().code, craft_anything_evidence::ErrorCode::OverLimit);
+        assert!(call(&engine, "core_build_plan_update", json!({"plan":build_plan("Replacement"),"based_on_revision":8})).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), super::MAX_STATE_BYTES as u64 + 1);
+    }
+
     #[test]
     fn finding_edits_refuse_unbacked_corrections_without_changing_memory() {
         let engine = Engine::new(crate::testing::session());
@@ -789,7 +1248,11 @@ mod tests {
                 call(&engine, "core_hypothesis_record", json!({"claim":format!("{label}-{index}")})).unwrap();
             }
         } else {
-            let result = call(&engine, "core_plan_update", json!({"steps":[{"title":label,"status":"todo"}],"based_on_revision":0}));
+            let result = if mode == "build_plan" {
+                call(&engine, "core_build_plan_update", json!({"plan":build_plan(&label),"based_on_revision":0}))
+            } else {
+                call(&engine, "core_plan_update", json!({"steps":[{"title":label,"status":"todo"}],"based_on_revision":0}))
+            };
             let outcome = match result {
                 Ok(_) => "ok",
                 Err(error) if error.code == craft_anything_evidence::ErrorCode::StaleRevision => "stale",
@@ -802,7 +1265,7 @@ mod tests {
     #[test]
     fn project_writers_serialize_across_processes() {
         let directory = tempfile::tempdir().unwrap();
-        for mode in ["append", "revision"] {
+        for mode in ["append", "revision", "build_plan"] {
             let project = Project::create(&directory.path().join(format!("{mode}.cany")), "Test", Purpose::Education).unwrap();
             let children: Vec<_> = ["first", "second"]
                 .into_iter()
@@ -835,6 +1298,9 @@ mod tests {
                     ["first", "second"].into_iter().map(|label| std::fs::read_to_string(project.root.join(format!("{label}.result"))).unwrap()).collect();
                 outcomes.sort();
                 assert_eq!(outcomes, ["ok", "stale"]);
+                if mode == "build_plan" {
+                    assert!(state.build_plan.is_some());
+                }
             }
             for (name, body) in super::render(&state) {
                 assert_eq!(std::fs::read_to_string(project.root.join("investigation").join(name)).unwrap(), body);

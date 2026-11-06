@@ -351,6 +351,12 @@ edit, right before committing.
 
 ## Design
 
+**A live plan was compared with old checks.** The facts worker read the current plan from disk,
+but judged it against the UI's workspace snapshot from before the run. A failed repeat could still
+look verified until the run ended. Read the latest saved check history on the same background
+worker before preparing the plan view; test both a failing and a passing repeat while the UI's
+snapshot stays unchanged.
+
 **An early error without a terminal event.** Model validation returned after reporting an error,
 but headless chat waits for `TurnDone`, not just an idle worker. Preflight failures and cancellation
 must finish the event sequence too; regression tests check both the error/status and the terminal event.

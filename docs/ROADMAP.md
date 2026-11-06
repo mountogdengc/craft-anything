@@ -79,6 +79,7 @@ Issues are ranked by people affected and how badly, after leaving out what's alr
 | 1 | R2.2 Every builder gets the same tools (that group), and Approvals | **decision** for Approvals | Agents other than Claude Code start but can't do the job, and Clean room's rule doesn't reach them |
 | 1 | R5.5 API-key builds fail in words people can use | — | This path has never been run live, and its errors say nothing |
 | 1 | R5.6 Tools report only what they saw | — | Confirmed false successes on macOS; golden rule 3 |
+| 1 | R5.8 Planned builds and honest completion | — | Requested fork work: preserve scope, collect missing inputs, and distinguish an available preview from verified completion |
 | 2 Proof | R5.7 Live checks owed | — | Built but never run for real; each can reopen work above. Lines run when the machine or key they need is at hand, Clean room and the quick start first |
 | 3 Depth | The rest of R2.2 | — | Detection waits for reports from 0.3.0 or later; ACP after the adapters work |
 | 3 | R2.4 Runtime study, R2.5 Behaviour checks | scripted input (R2.4) before R2.5's sheet check | Makes "ready" mean more for apps and games |
@@ -408,6 +409,25 @@ yet, and the quick start is how every new person begins.
 - [ ] Check the Kimi Code, Factory Droid and WorkBuddy registrations in the real apps
 
 ---
+
+### R5.8 Planned builds and honest completion
+Owner: maintainers · Status: in progress
+
+The fork needs a durable project plan connecting requested capabilities, implementation phases,
+required inputs and acceptance checks. An output that can be previewed must not be reported as
+complete while required checks or planned work remain unresolved.
+
+- [x] Add versioned build plans with phases, required inputs, acceptance criteria, headless tools,
+      builder integration and a project view; evaluate every final check and preserve an incomplete
+      preview when verification fails — claimed: Codex, branch feature/r5.8-build-planning
+- [ ] Capture authenticated workflows and nested route/section states, and report redirected or
+      unavailable reference destinations as missing evidence.
+- [ ] Add interaction and persistence checks tied to the planned workflows; invalidate verification
+      after relevant implementation changes.
+- [ ] Reconcile textual tool fallback handling with genuine tool results and prevent speculative
+      action observations from being treated as completed work.
+- [ ] Add explicit scope revisions tied to the person's changed request, retaining the previous
+      requirements and reason for reduction; ordinary plan progress updates preserve required scope.
 
 ## M1 Extensibility
 
