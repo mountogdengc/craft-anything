@@ -34,11 +34,11 @@
 
 **Interfaces:** Preserve `Worker::finish_checks`, `CheckVerdict`, `planning::review`, build-plan tools and project UI; incorporate upstream approval fields and stopped feed steps.
 
-- [ ] Record the R5.8 integration claim and publish the branch early.
-- [ ] Build the unchanged baseline CLI and run the baseline workspace tests, recording any existing failures.
-- [ ] Merge the pinned upstream main; resolve independent additions by retaining both sides.
-- [ ] Preserve the experiments ignore rule and add planning messages to newly introduced catalogs.
-- [ ] Verify formatting, translations and compilation before committing the upstream integration.
+- [x] Record the R5.8 integration claim and publish the branch early.
+- [x] Build the unchanged baseline CLI and run the baseline engine/AI library suites; run the full workspace suite on the combined tree.
+- [x] Merge the pinned upstream main; resolve independent additions by retaining both sides.
+- [x] Preserve the experiments ignore rule and add planning messages to newly introduced catalogs.
+- [x] Verify formatting, translations and compilation before committing the upstream integration.
 
 ### Task 2: Protect manifest migration
 
@@ -46,10 +46,10 @@
 
 **Interfaces:** `MANIFEST_VERSION = 4`, one migration per version, `Workspace::open/save/duplicate` preserve both incomplete status and approval preferences.
 
-- [ ] Add behavioral migration/save/duplicate tests for fork-v3 and upstream-v3 projects, and future-version write refusal.
-- [ ] Observe the migration tests fail under the merged version-3 format.
-- [ ] Add the v3-to-v4 migration, update format documentation and regenerate schemas.
-- [ ] Run the engine tests and strict Clippy; commit with the integration when green.
+- [x] Add behavioral migration/save/duplicate tests for fork-v3 and upstream-v3 projects, and future-version write refusal.
+- [x] Observe the migration tests fail under the merged version-3 format.
+- [x] Add the v3-to-v4 migration, update format documentation and regenerate schemas.
+- [x] Run the engine tests and strict Clippy; commit with the integration when green.
 
 ### Task 3: Adapt observation and comparison fixes
 
@@ -57,11 +57,11 @@
 
 **Interfaces:** Existing `CheckVerdict` is authoritative for missing comparisons. Final completion also requires no unresolved high/critical unknowns and a complete saved plan. Capture can recover a missing observation and optionally reuse one exact-match running process without closing it.
 
-- [ ] Fetch the pinned PR heads for #973 (`f0ed9445563ebe9306ca566b7c51cffc9bc97b49`) and #1032 (`202d2f08501db8b452e2b32d7933c30b506e2d8c`).
-- [ ] Bring over their focused regressions first; add integration cases for complete/incomplete plans and missing comparison.
-- [ ] Confirm the new regressions expose missing observation/readiness behavior.
-- [ ] Adapt capture, stale-artifact cleanup, missing-comparison metadata and builder guidance; preserve the fork's incomplete-preview path.
-- [ ] Run targeted regressions and affected suites; document upstream attribution and remaining limits.
+- [x] Fetch the pinned PR heads for #973 (`f0ed9445563ebe9306ca566b7c51cffc9bc97b49`) and #1032 (`202d2f08501db8b452e2b32d7933c30b506e2d8c`).
+- [x] Bring over their focused regressions first; add integration cases for complete/incomplete plans and missing comparison.
+- [x] Confirm the new regressions expose missing observation/readiness behavior.
+- [x] Adapt capture, stale-artifact cleanup, missing-comparison metadata and builder guidance; preserve the fork's incomplete-preview path.
+- [x] Run targeted regressions and affected suites; document upstream attribution and remaining limits.
 
 ### Task 4: Verify and prepare review
 
@@ -69,7 +69,7 @@
 
 **Interfaces:** CLI built before AI tests; all workspace suites, strict Clippy, format, layers, locks, secrets, translation/tool/schema checks and shared WASM compilation.
 
-- [ ] Run required checks with Rust 1.99 and the dedicated target directory; inspect and repair failures within scope.
-- [ ] Request a fresh whole-branch review and address important findings with regression tests.
-- [ ] Update roadmap/status and local devlog with exact evidence and limitations.
-- [ ] Commit, push the named integration branch and open a PR into the fork's main; leave merging for review.
+- [x] Run required checks with Rust 1.99 and the dedicated target directory; inspect and repair failures within scope.
+- [x] Request a fresh whole-branch review and address important findings with regression tests.
+- [x] Update roadmap/status and local devlog with exact evidence and limitations.
+- [x] Commit, push the named integration branch and open a PR into the fork's main; leave merging for review.

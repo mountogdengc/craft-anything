@@ -107,9 +107,16 @@ mod tests {
     fn deep_nesting_is_bounded() {
         let mut v = json!(0);
         for _ in 0..2000 {
-            v = json!([v]);
+            // Construct directly: json! serializes the whole existing tree on each wrap,
+            // overflowing the test thread before the bounded writer can be exercised.
+            v = Value::Array(vec![v]);
         }
         let s = canonical_json(&v);
+        // Also dismantle the fixture iteratively: serde_json's recursive Drop is not the
+        // canonical writer under test, and 2,000 levels exceed a Windows debug thread's stack.
+        while let Value::Array(mut items) = v {
+            v = items.pop().unwrap();
+        }
         assert!(s.contains("null"));
     }
 

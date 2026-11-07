@@ -84,7 +84,8 @@ does not. Fabricated evidence IDs and unsupported check citations are rejected.
 ## What completion means
 
 Automatic **Ready** requires a nonempty current check round whose every result meets its basic
-success condition, similarity threshold, claims and evidence requirements. The saved plan must
+success condition, similarity threshold, claims and evidence requirements, with no unresolved
+high or critical investigation question. The saved plan must
 also have completed phases, supplied required inputs and verified required acceptance criteria.
 No checks, any failing result in the current round, an unfinished phase or an unverified criterion keeps the
 project at **Needs more work**. Available previews remain openable, and **Continue** resumes the
@@ -92,6 +93,38 @@ work. The final progress stage is not shown as done for an incomplete result.
 
 The person's explicit **It's done** action remains available through `project_build_finish` and
 records that the person accepted the current result. It is separate from automatic completion.
+
+## Native observation and missing comparisons
+
+GUI recreations need a usable picture of the original or a readable supplied reference before
+the builder starts. With Run to study enabled, an executable target can recover a missing or legacy
+window capture on a follow-up. Blank and unreadable pictures, and a modal dialog covering the
+working interface, remain observation gaps. On Windows the capture tool can reuse one open
+process with the exact executable path; it leaves that process open. Captures follow the selected
+process and its descendants and report the process that actually owns the pictured window.
+
+If runtime capture fails, readable supplied references still allow implementation. The study
+records the capture limitation and discards partial runtime artifacts; cancellation stops the run.
+In Deep mode, console programs recover recorded input/output runs instead of requiring a window,
+and static package evidence can support implementation without a GUI capture. These paths still
+need the applicable comparison and plan evidence before automatic Ready.
+
+An app-screenshot check can establish that the build runs while still recording `not_compared`
+when a reference comparison was expected but unavailable. This marker survives storage, blocks
+the typed check verdict and acceptance citations, and ends automatic refinement without spending
+more builder turns on missing reference input. The project keeps its preview and unfinished plan.
+Adding readable references and completing a passing check can revalidate earlier legitimate
+check citations; a citation that never supported its claim is still refused.
+
+Runtime self-check attempts discard the previous attempt's window picture and UI tree before
+capturing again. Capture failures remain unknowns, and cancellation remains cancellation. A
+startup capture establishes one visible state; workflow coverage still requires its own evidence.
+Native picture similarity continues to use the configured picture threshold.
+Unreadable investigation metadata or question records also keep the result incomplete and prevent
+a self-check from reporting that it would pass; a failed read is never an empty question list.
+
+These changes adapt upstream [#973](https://github.com/storytold/craft-anything/pull/973) and
+[#1032](https://github.com/storytold/craft-anything/pull/1032) to the durable planning contract.
 
 This foundation does not automatically generate and execute tests for every arbitrary workflow.
 The relevance and completeness of recorded criteria and evidence still need judgment. Existing

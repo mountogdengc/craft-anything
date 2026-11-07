@@ -249,13 +249,14 @@ impl RebuildRun {
             editor: None,
             notes: notes.clone(),
             feed: feed.clone(),
-            assets: hub.has_asset_keys(),
+            assets: false,
             decompiled: false,
             usage: Some(UsageClock { root: root.clone(), since: Instant::now() }),
             self_check: None,
             reset_progress_after_notes: false,
         };
         let r2 = running.clone();
+        let key_store = hub.keys.clone();
         std::thread::Builder::new()
             .name("rebuild".into())
             .spawn(move || {
@@ -264,7 +265,10 @@ impl RebuildRun {
                 // A clone can run for hours: keep the computer from sleeping until it ends.
                 let awake = craft_anything_platform::keep_awake();
                 let _here = self_check::BuildingHere::new(&ws.root);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run(&mut ws, entry, api, extractor, &opts)));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ctx.load_asset_keys(&key_store);
+                    ctx.run(&mut ws, entry, api, extractor, &opts)
+                }));
                 let (ok, message, paused) = match result {
                     Ok(Ok(m)) => (ws.manifest.status == Status::Ready, m, false),
                     Ok(Err(e)) if e.code == ErrorCode::Cancelled => {
@@ -447,6 +451,15 @@ struct UsageClock {
 /// How often a long agent turn saves the time worked so far, so a crash loses little of it.
 const USAGE_FLUSH: Duration = Duration::from_secs(60);
 
+/// Record `e` in the feed, send it and wake the window, under one lock.
+fn emit_event(feed: &Mutex<feed::FeedLog>, tx: &Sender<RunEvent>, wake: &Wake, e: RunEvent) {
+    let mut feed = feed.lock().unwrap_or_else(PoisonError::into_inner);
+    feed.record(&e);
+    let _ = tx.send(e);
+    drop(feed);
+    wake.call();
+}
+
 impl Worker {
     /// Add the time worked since the last record (and an agent turn's tokens and reported cost)
     /// to the project's usage.json. The run is its only writer; a failure is logged and the build
@@ -468,11 +481,7 @@ impl Worker {
 
     /// Recorded and sent under one lock, so [`RebuildRun::feed_now`] sees each event once.
     fn emit(&self, e: RunEvent) {
-        let mut feed = self.feed.lock().unwrap_or_else(PoisonError::into_inner);
-        feed.record(&e);
-        let _ = self.tx.send(e);
-        drop(feed);
-        self.wake.call();
+        emit_event(&self.feed, &self.tx, &self.wake, e);
     }
 
     fn step(&self, ws: &mut Workspace, step: Step, status: Status, text: &str) -> Result<(), ToolError> {
@@ -492,6 +501,21 @@ impl Worker {
         let result = self.engine.call(tool, params, opts);
         self.emit(RunEvent::Agent(AgentEvent::ToolFinished { call_id, tool: tool.to_string(), ok: result.is_ok(), summary: String::new(), evidence_id: None }));
         result
+    }
+
+    /// An API backend's builder runs its tools in this session, not in a tool server that loads the
+    /// keys itself (#923). Read on the worker because the keychain can block, and for each run so a
+    /// key saved outside the app since the last one counts. The session stays held through the
+    /// read, so a key removed meanwhile can't be put back by keys read before it went. What the
+    /// brief says about assets comes from the same read, so the two agree.
+    fn load_asset_keys(&mut self, store: &crate::KeyStore) {
+        let mut session = self.engine.session();
+        session.label("Load the asset keys");
+        let providers = session.ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
+        let keys = crate::keys::asset_keys(store, &providers);
+        // The brief offers the built-in models, so a key for another provider doesn't count.
+        self.assets = craft_anything_engines::assets::AssetProviders::built_in().ids().into_iter().any(|id| keys.get(id).is_some());
+        session.ext.insert(Arc::new(keys));
     }
 
     /// Point the engine at this workspace: its investigation project and inbox.
@@ -612,14 +636,19 @@ impl Worker {
             progress.save(&ws.root)?;
         }
         // Fail before any work when the agent's tools are missing or it can't sign in.
-        let remote = entry.config.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty());
-        if !remote && api.is_none() {
+        let remote_host = entry.config.ssh_host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+        let remote = remote_host.is_some();
+        if api.is_none() {
             let adapter = opts.adapters.for_backend(&entry.config.model, &entry.options);
-            crate::cli_agents::check_builder_tools(adapter.as_ref(), &entry.config.model, &entry.options, &self.stop)?;
-            let program = crate::cli_agents::program_of(&entry.config, &entry.options);
-            if adapter.signed_in(&program) == Some(false) {
-                return Err(ToolError::new(ErrorCode::BadSettings, not_signed_in(&entry.config.model, adapter.signed_in_before()))
-                    .with_remediation(adapter.sign_in_fix().unwrap_or_default()));
+            if let Some(host) = remote_host {
+                adapter.check_remote_tool_server(host, &self.stop)?;
+            } else {
+                crate::cli_agents::check_builder_tools(adapter.as_ref(), &entry.config.model, &entry.options, &self.stop)?;
+                let program = crate::cli_agents::program_of(&entry.config, &entry.options)?;
+                if adapter.signed_in(&program) == Some(false) {
+                    return Err(ToolError::new(ErrorCode::BadSettings, not_signed_in(&entry.config.model, adapter.signed_in_before()))
+                        .with_remediation(adapter.sign_in_fix().unwrap_or_default()));
+                }
             }
         }
         self.attach(ws)?;
@@ -645,6 +674,7 @@ impl Worker {
                 self.extract(ws, kind, &name, ex)?;
             }
         }
+        self.ensure_native_observation(ws, kind)?;
         // A coding agent resumes its own session; our loop resumes its kept transcript.
         let resumable = api.as_ref().is_none_or(crate::agent::ApiConversation::resumed);
         let api_loop = api.is_some();
@@ -686,6 +716,9 @@ impl Worker {
                 if api_loop { format!("{API_BUILDER}\n\n{b}") } else { b }
             }
         };
+        if matches!(ws.manifest.target, TargetRef::Local { .. }) {
+            prompt.push_str("\n\nRead capture/README.md again before working: the host may have recovered observation since the previous turn. Open capture/window.png and read capture/ui-tree.json when present. These are observations from Craft Anything's built-in tools. A startup or license dialog is only that state, so keep unobserved workflows open as unknowns. Use the Craft Anything runtime tools for permitted observation; access to a separate computer-use plugin is independent of this project's tools.");
+        }
         // The extraction step left the original's files in app/Original/: the builder starts from them.
         if first && ws.app_dir().join(ORIGINALS_MANIFEST).is_file() {
             prompt.push_str(ORIGINALS_READY);
@@ -696,6 +729,12 @@ impl Worker {
             let handoff = keeper.as_ref().and_then(|a| a.handoff(&kept_session(ws)?, HANDOFF_CHARS));
             resumed_elsewhere(&brief(kind, &cx, opts.message.as_deref()), &ws.manifest.last_reply, handoff.as_deref())
         });
+        // "Just ask" runs apart from the builder's session, and the person's message may follow on from it (#857).
+        let new_request = opts.message.as_deref().is_some_and(|m| !m.trim().is_empty());
+        let mut asked = if new_request { craft_anything_engine::questions::untold(ws, deep) } else { Vec::new() };
+        let just_asked = just_asked(&asked);
+        prompt.insert_str(0, &just_asked);
+        fresh = fresh.map(|f| format!("{just_asked}{f}"));
         let mut round = ws.manifest.checks.iter().map(|c| c.round).max().unwrap_or(0);
         // A new request starts the count of checks that found no working build again. "Try again" on
         // a build that already reached the limit stops before another builder turn is paid for (#736).
@@ -797,6 +836,14 @@ impl Worker {
                         return Err(error);
                     }
                 };
+                // Only a finished turn counts: telling the builder twice costs little, and a turn that
+                // failed may not have told it at all.
+                let told = std::mem::take(&mut asked);
+                if !told.is_empty()
+                    && let Err(e) = craft_anything_engine::questions::mark_told(ws, &told)
+                {
+                    log::warn!("couldn't record which questions the builder was told: {}", e.message);
+                }
                 if !reply.trim().is_empty() {
                     ws.manifest.last_reply = reply.trim().to_string();
                 }
@@ -835,8 +882,7 @@ impl Worker {
                 }
             }
             round += 1;
-            let checking = if ws.manifest.target == TargetRef::None { "Checking the build…" } else { "Checking the build against the original…" };
-            self.step(ws, Step::Check, Status::Checking, checking)?;
+            self.step(ws, Step::Check, Status::Checking, "Checking the build and available evidence…")?;
             let mut checks = self.checks_with_a_retry(ws, kind, round)?;
             // Later tools and UI views must judge the result by this run's quality target.
             // Preserve any explicit target supplied by the check itself.
@@ -865,6 +911,11 @@ impl Worker {
             }
             let not_good = checks.iter().find(|c| !c.good(opts.good_enough));
             let plan_review = planning::review(ws, opts.good_enough)?;
+            // Missing reference evidence needs input or observation, rather than more automatic
+            // builder turns. Final completion still evaluates every check and plan obligation.
+            if checks.iter().any(|check| check.not_compared) {
+                break;
+            }
             if not_good.is_some() && progress_available && progress.stalled() {
                 // A check-only resume skipped the builder's before-turn scan. A real edit
                 // while the project was closed (or during this check) still starts an attempt.
@@ -911,14 +962,15 @@ impl Worker {
             self.emit(RunEvent::Preview(url));
         }
         let last_round: Vec<CheckResult> = ws.manifest.checks.iter().filter(|c| c.round == round).cloned().collect();
-        let verdict = CheckVerdict::latest(&last_round, good_enough);
+        let open = self_check::open_questions(ws);
+        let readiness = open.as_ref().map_err(Clone::clone).and_then(|open| self_check::require_ready(&last_round, good_enough, open));
         let plan_review = planning::review(ws, good_enough)?;
-        let (status, step, mut summary) = if verdict.is_ready() && plan_review.complete() {
+        let (status, step, mut summary) = if readiness.is_ok() && plan_review.complete() {
             (Status::Ready, Step::Done, format!("Ready: {}.", self_check::summary(&last_round, good_enough)))
         } else {
             let mut reasons = Vec::new();
-            if !verdict.is_ready() {
-                reasons.push(verdict.explanation());
+            if let Err(error) = readiness {
+                reasons.push(error.message);
             }
             if !plan_review.complete() {
                 reasons.push(plan_review.explanation());
@@ -926,7 +978,7 @@ impl Worker {
             (Status::Incomplete, Step::Check, format!("Needs more work.\n{}", reasons.join("\n")))
         };
         // What the builder couldn't find out is said, not hidden.
-        match self_check::open_questions(ws).len() {
+        match open.as_ref().map_or(0, Vec::len) {
             0 => {}
             1 => summary.push_str(" 1 question about the original is still open."),
             n => summary.push_str(&format!(" {n} questions about the original are still open.")),
@@ -1307,17 +1359,28 @@ pub fn project_builder<'a>(cfg: &crate::AiConfig, ws: &'a Workspace) -> Option<&
     ws.manifest.builder.as_deref().filter(|n| cfg.get(n).is_some_and(|b| b.config.enabled))
 }
 
-/// The backend that builds: the one named, else the Builder role's, else an agent app, else any
-/// enabled AI backend (which builds with our own agent loop and the Build tools).
+/// The backend that builds: the one named while it is set up and on, else the Builder role's,
+/// else an agent app, else any enabled AI backend (which builds with our own agent loop and the
+/// Build tools).
 pub fn builder_backend(cfg: &crate::AiConfig, named: Option<&str>) -> Result<crate::BackendEntry, ToolError> {
-    let found = match named {
-        Some(n) => cfg.get(n).cloned(),
-        None => {
-            cfg.backend_for(Role::Builder).or_else(|| cfg.enabled().find(|b| b.config.kind == BackendKind::AgentCli)).or_else(|| cfg.enabled().next()).cloned()
+    if let Some(n) = named {
+        let Some(entry) = cfg.get(n) else {
+            return Err(
+                ToolError::invalid(format!("No AI backend named {n:?}")).with_remediation("See `craft-anything-cli ai list`, or add one in Settings → AI.")
+            );
+        };
+        if !entry.config.enabled {
+            return Err(ToolError::new(ErrorCode::BadSettings, format!("{} is turned off.", entry.config.name))
+                .with_remediation("Turn it on in Settings → AI, or choose another backend for this build."));
         }
-    };
-    found.ok_or_else(|| {
-        ToolError::new(ErrorCode::BadSettings, "Building needs a coding agent (such as Claude Code) or an AI backend with an API key.")
-            .with_remediation("Install a coding agent or add an API key in Settings → AI, then try again.")
-    })
+        return Ok(entry.clone());
+    }
+    cfg.backend_for(Role::Builder)
+        .or_else(|| cfg.enabled().find(|b| b.config.kind == BackendKind::AgentCli))
+        .or_else(|| cfg.enabled().next())
+        .cloned()
+        .ok_or_else(|| {
+            ToolError::new(ErrorCode::BadSettings, "Building needs a coding agent (such as Claude Code) or an AI backend with an API key.")
+                .with_remediation("Install a coding agent or add an API key in Settings → AI, then try again.")
+        })
 }
