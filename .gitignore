@@ -16,3 +16,6 @@ corpus/
 *.pfx
 *.key
 .claude/settings.local.json
+
+# Local experiments
+/experiments/
