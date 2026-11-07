@@ -17,7 +17,7 @@
 //! already has their files, they're either the app itself (`app_in_root`: the builder edits them in
 //! place and the folders above sit beside them) or material to start from, with the app in app/.
 
-use crate::inbox::now_ms;
+use crate::inbox::{next_counter, now_ms};
 use crate::project::write_atomic;
 use crate::versioned::{self, upgrade};
 use craft_anything_evidence::{ErrorCode, ToolError};
@@ -78,10 +78,10 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize)
 }
 
 /// The current `craft.json` format version. Bumping it means appending a step to [`MANIFEST_STEPS`].
-pub const MANIFEST_VERSION: u32 = 3;
+pub const MANIFEST_VERSION: u32 = 4;
 
 /// The steps that bring an older `craft.json` forward; step `i` goes from version `i` to `i + 1`.
-const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3];
+const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3, manifest_v3_to_v4];
 const _: () = assert!(MANIFEST_STEPS.len() == MANIFEST_VERSION as usize, "one step per craft.json version");
 
 /// Version 0 (no `version` field) has the same shape as version 1; only the number is new.
@@ -96,9 +96,15 @@ fn manifest_v1_to_v2(doc: &mut Value) -> Result<(), String> {
     if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
 }
 
-/// Version 3 can record an incomplete build separately from a ready or paused one. Existing
-/// statuses stay as they were: older checks don't establish whether the person called it done.
+/// Version 3 records the incomplete status in this fork and approval choices upstream.
+/// Existing statuses keep their meaning; absent approval choices use their defaults.
 fn manifest_v2_to_v3(doc: &mut Value) -> Result<(), String> {
+    if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
+}
+
+/// Version 4 combines both historical version-3 formats. Their fields retain their meaning;
+/// the new number keeps older builds from saving away approval choices they do not understand.
+fn manifest_v3_to_v4(doc: &mut Value) -> Result<(), String> {
     if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
 }
 
@@ -252,6 +258,10 @@ pub struct CheckResult {
     /// being good enough, however alike the rest looks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<Claim>,
+    /// A comparison was expected, but no readable reference established it. `passed` may still
+    /// report a working build; this marker blocks readiness and recorded plan verification.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_compared: bool,
 }
 
 /// One thing a build must do, checked on its own ("The start page doesn't scroll sideways at
@@ -302,6 +312,7 @@ impl CheckResult {
             pages: Vec::new(),
             unknowns: Vec::new(),
             claims: Vec::new(),
+            not_compared: false,
         }
     }
 
@@ -309,6 +320,7 @@ impl CheckResult {
     /// alike as its own bar, else `good_enough`.
     pub fn good(&self, good_enough: f64) -> bool {
         self.passed
+            && !self.not_compared
             && self.unknowns.is_empty()
             && self.claims.iter().all(|c| c.passed)
             && self.similarity.is_none_or(|s| s >= self.good_enough.unwrap_or(good_enough))
@@ -352,6 +364,12 @@ impl CheckVerdict {
         }
         let mut reasons = Vec::new();
         for result in latest.filter(|c| !c.good(good_enough)) {
+            if result.not_compared {
+                reasons.push(CheckBlocker::MissingEvidence {
+                    check: result.check.clone(),
+                    detail: "The original was not compared with the build. Supply readable reference pictures, then continue.".into(),
+                });
+            }
             if !result.passed {
                 reasons.push(CheckBlocker::CheckFailed { check: result.check.clone(), detail: result.note.clone() });
             }
@@ -418,6 +436,8 @@ struct CheckRecord {
     unknowns: Vec<String>,
     #[serde(default)]
     claims: Vec<Claim>,
+    #[serde(default)]
+    not_compared: bool,
 }
 
 impl From<CheckRecord> for CheckResult {
@@ -435,6 +455,7 @@ impl From<CheckRecord> for CheckResult {
             pages: r.pages,
             unknowns: r.unknowns,
             claims: r.claims,
+            not_compared: r.not_compared,
         }
     }
 }
@@ -498,6 +519,11 @@ pub struct Manifest {
     /// (`Settings::questions`). The person's, like the budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub questions: Option<Questions>,
+    /// What the builder's approvals get in this project, by kind of action; a kind that isn't here
+    /// follows Auto mode ([`ActionKind::default_in`]). The person's, like the budget.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[schemars(schema_with = "approvals_schema")]
+    pub approvals: std::collections::BTreeMap<ActionKind, Approval>,
     /// The builder finished its turn and the run's checks haven't reported on it yet, so a run
     /// that picks this up only needs to check: nothing is left to build.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -542,6 +568,7 @@ impl Manifest {
             start_files: Vec::new(),
             builder: None,
             questions: None,
+            approvals: Default::default(),
             awaiting_check: false,
             not_working_checks: 0,
         }
@@ -560,6 +587,7 @@ impl Manifest {
         self.allowed_actions = other.allowed_actions.clone();
         self.builder.clone_from(&other.builder);
         self.questions = other.questions;
+        self.approvals.clone_from(&other.approvals);
         self.name.clone_from(&other.name);
     }
 }
@@ -759,14 +787,15 @@ impl Workspace {
             copy.manifest.note.clone_from(&m.note);
         }
         copy.save()?;
-        let (budget, generate, builder, allowed, questions) =
-            (m.asset_budget_usd, m.generate_assets, m.builder.clone(), m.allowed_actions.clone(), m.questions);
+        let (budget, generate, builder, allowed, questions, approvals) =
+            (m.asset_budget_usd, m.generate_assets, m.builder.clone(), m.allowed_actions.clone(), m.questions, m.approvals.clone());
         copy.set_person(|c| {
             c.asset_budget_usd = budget;
             c.generate_assets = generate;
             c.builder = builder;
             c.allowed_actions = allowed;
             c.questions = questions;
+            c.approvals = approvals;
         })?;
         Ok(copy)
     }
@@ -1119,6 +1148,137 @@ pub enum Questions {
     Decide,
 }
 
+/// A kind of builder action that asks for approval, which a project can decide about ahead of time
+/// (`Manifest::approvals`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Reading websites and searching the web.
+    Web,
+    /// Commands outside the usual build commands.
+    Commands,
+    /// Changing files outside the project.
+    OutsideFiles,
+    /// Pushing to a git server or publishing anywhere (`git push`, `npm publish`, `gh pr create`…).
+    Publish,
+    /// Deleting anything outside the project or the temp folder.
+    DeleteOutside,
+    /// Changing the system, its settings or users, system files, or Craft Anything's own records.
+    System,
+    /// Tools with no rule of their own.
+    OtherTools,
+}
+
+/// What an action of one [`ActionKind`] gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Approval {
+    /// Done without asking.
+    Allow,
+    /// A card for the person, and the builder waits for the answer.
+    Ask,
+    /// Not done, without asking: the builder is told to find another way.
+    Refuse,
+}
+
+/// `Manifest::approvals` in the published schema: only the kinds' names as keys, which a map's
+/// own schema leaves open.
+fn approvals_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let names: Vec<&str> = ACTION_KINDS.iter().map(|r| r.name).collect();
+    schemars::json_schema!({
+        "type": "object",
+        "propertyNames": { "enum": names },
+        "additionalProperties": generator.subschema_for::<Approval>(),
+    })
+}
+
+/// One row of [`ACTION_KINDS`].
+#[derive(Debug, Clone, Copy)]
+pub struct KindRow {
+    pub kind: ActionKind,
+    /// Its name in tools and slash commands.
+    pub name: &'static str,
+    /// What it covers, as the builder is told when it's refused ("pushing or publishing anything").
+    pub what: &'static str,
+    /// What it gets when the project hasn't chosen, with Auto mode on and off.
+    pub auto: Approval,
+    pub manual: Approval,
+}
+
+/// Every kind. Auto mode lets through what can be undone and refuses the rest; without it,
+/// everything but reading the web asks.
+pub const ACTION_KINDS: &[KindRow] = &[
+    KindRow { kind: ActionKind::Web, name: "web", what: "reading the web", auto: Approval::Allow, manual: Approval::Allow },
+    KindRow { kind: ActionKind::Commands, name: "commands", what: "commands outside the usual build commands", auto: Approval::Allow, manual: Approval::Ask },
+    KindRow { kind: ActionKind::OutsideFiles, name: "outside_files", what: "changing files outside the project", auto: Approval::Allow, manual: Approval::Ask },
+    KindRow { kind: ActionKind::Publish, name: "publish", what: "pushing or publishing anything", auto: Approval::Refuse, manual: Approval::Ask },
+    KindRow {
+        kind: ActionKind::DeleteOutside,
+        name: "delete_outside",
+        what: "deleting anything outside the project or the temp folder",
+        auto: Approval::Refuse,
+        manual: Approval::Ask,
+    },
+    KindRow {
+        kind: ActionKind::System,
+        name: "system",
+        what: "changing the system, its settings or users, system files, or Craft Anything's own records",
+        auto: Approval::Refuse,
+        manual: Approval::Ask,
+    },
+    KindRow {
+        kind: ActionKind::OtherTools,
+        name: "other_tools",
+        what: "tools with no approval rule of their own",
+        auto: Approval::Refuse,
+        manual: Approval::Ask,
+    },
+];
+
+impl ActionKind {
+    fn row(self) -> Option<&'static KindRow> {
+        ACTION_KINDS.iter().find(|r| r.kind == self)
+    }
+
+    /// Its name in tools and slash commands (`publish`).
+    pub fn name(self) -> &'static str {
+        self.row().map_or("", |r| r.name)
+    }
+
+    /// What it covers, in words for the builder.
+    pub fn what(self) -> &'static str {
+        self.row().map_or("", |r| r.what)
+    }
+
+    /// The kind named `name`, in any case.
+    pub fn named(name: &str) -> Option<ActionKind> {
+        ACTION_KINDS.iter().find(|r| r.name.eq_ignore_ascii_case(name)).map(|r| r.kind)
+    }
+
+    /// What it gets when the project hasn't chosen.
+    pub fn default_in(self, auto_mode: bool) -> Approval {
+        self.row().map_or(Approval::Ask, |r| if auto_mode { r.auto } else { r.manual })
+    }
+}
+
+impl Approval {
+    /// How much it holds back: allow, then ask, then refuse.
+    pub fn strictness(self) -> u8 {
+        match self {
+            Approval::Allow => 0,
+            Approval::Ask => 1,
+            Approval::Refuse => 2,
+        }
+    }
+}
+
+impl Manifest {
+    /// What an action of `kind` gets in this project.
+    pub fn approval(&self, kind: ActionKind, auto_mode: bool) -> Approval {
+        self.approvals.get(&kind).copied().unwrap_or_else(|| kind.default_in(auto_mode))
+    }
+}
+
 /// What the files already in a picked folder are to a new project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1238,7 +1398,7 @@ pub fn pasted_dir() -> PathBuf {
     dirs::cache_dir().or_else(|| dirs::home_dir().map(|h| h.join(".cache"))).unwrap_or_else(std::env::temp_dir).join("Craft Anything").join("pasted")
 }
 
-/// Save a picture pasted from the clipboard (8-bit RGBA, `width`×`height`) as `pasted-<time>.png`
+/// Save a picture pasted from the clipboard (8-bit RGBA, `width`×`height`) as `pasted-<time>-<n>.png`
 /// in `dir`, readable only by this person, where it waits until its message is sent (which
 /// copies it into the project). Pastes from earlier days are cleared out first, except those in
 /// `keep` (still attached to a draft or a message).
@@ -1264,11 +1424,13 @@ pub fn save_pasted_picture(dir: &Path, width: u32, height: u32, rgba: Vec<u8>, k
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     forget_old_pastes(dir, keep);
-    // The name is taken with create_new, so two pastes (or two copies of the app) never share one.
+    // The counter makes the name unique within this process, so a paste never reuses a name that
+    // forget_old_pastes just freed in the same millisecond; create_new still guards two app copies.
     let ms = now_ms();
+    let c = next_counter();
     let mut n = 1u32;
     let path = loop {
-        let path = if n == 1 { dir.join(format!("pasted-{ms}.png")) } else { dir.join(format!("pasted-{ms}-{n}.png")) };
+        let path = if n == 1 { dir.join(format!("pasted-{ms}-{c}.png")) } else { dir.join(format!("pasted-{ms}-{c}-{n}.png")) };
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(_) => break path,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n = n.saturating_add(1),
@@ -1564,6 +1726,41 @@ mod tests {
     }
 
     #[test]
+    fn approval_choices_survive_an_old_manifest_a_stale_save_and_a_copy() {
+        // A version-2 craft.json (before approvals) opens with none chosen and is saved as version 4.
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = MANIFEST_V0.replacen('{', r#"{ "version": 2,"#, 1);
+        std::fs::write(dir.path().join(MANIFEST), &v2).unwrap();
+        let mut run = Workspace::open(dir.path()).unwrap();
+        assert_eq!((run.manifest.version, run.manifest.approvals.is_empty(), run.is_read_only()), (4, true, false));
+        run.save().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(saved["version"], 4);
+        assert!(saved.get("approvals").is_none(), "nothing chosen, nothing written");
+        // The person chooses while a run holds an older copy; the run's save keeps the choice.
+        Workspace::open(dir.path())
+            .unwrap()
+            .set_person(|m| {
+                m.approvals.insert(ActionKind::Publish, Approval::Ask);
+                m.approvals.insert(ActionKind::Commands, Approval::Refuse);
+            })
+            .unwrap();
+        run.manifest.note = "Building".into();
+        run.save().unwrap();
+        let disk = Workspace::open(dir.path()).unwrap().manifest;
+        assert_eq!(disk.approvals.get(&ActionKind::Publish), Some(&Approval::Ask));
+        assert_eq!(disk.approval(ActionKind::Commands, true), Approval::Refuse);
+        let saved: Value = serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(saved["approvals"], serde_json::json!({"commands": "refuse", "publish": "ask"}));
+        // A copy keeps them.
+        let copy = Workspace::open(dir.path()).unwrap().duplicate("Example copy").unwrap();
+        assert_eq!(Workspace::open(&copy.root).unwrap().manifest.approvals, disk.approvals);
+        // An unknown kind isn't read as something else.
+        let unknown = MANIFEST_V0.replacen('{', r#"{ "version": 3, "approvals": {"everything": "allow"},"#, 1);
+        assert!(read_manifest(unknown.as_bytes()).is_err());
+    }
+
+    #[test]
     fn newer_manifests_open_read_only_and_are_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let newer = MANIFEST_V0.replacen('{', r#"{ "version": 99, "a_field_from_the_future": [1, 2],"#, 1);
@@ -1687,7 +1884,7 @@ mod tests {
         ws.set_status(Status::Incomplete, "Drafts do not survive reopening yet.").unwrap();
         let reopened = Workspace::open(&ws.root).unwrap();
         assert_eq!(reopened.manifest.status, Status::Incomplete);
-        assert_eq!(reopened.manifest.version, 3);
+        assert_eq!(reopened.manifest.version, 4);
         let copy = reopened.duplicate("Draft copy").unwrap();
         assert_eq!((copy.manifest.status, copy.manifest.note), (Status::Incomplete, ws.manifest.note));
     }

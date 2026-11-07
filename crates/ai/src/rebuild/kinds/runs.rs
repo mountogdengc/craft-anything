@@ -130,6 +130,7 @@ impl Worker {
                     kept.push(*name);
                     records.push(record);
                 }
+                Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
                 Err(e) => log::warn!("running {} with {name} failed: {}", program.display(), e.message),
             }
         }

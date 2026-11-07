@@ -179,14 +179,21 @@ impl Project {
     pub fn load_unknowns(&self) -> Result<Vec<Unknown>, ToolError> {
         let mut out = Vec::new();
         let dir = self.root.join("unknowns");
-        let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(out) };
-        for e in entries.flatten() {
-            if let Ok(bytes) = std::fs::read(e.path()) {
-                match serde_json::from_slice::<Unknown>(&bytes) {
-                    Ok(u) => out.push(u),
-                    Err(err) => log::warn!("skipping unreadable unknown {}: {err}", e.path().display()),
-                }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(ToolError::io(dir.display(), e)),
+        };
+        for entry in entries {
+            let path = entry.map_err(|e| ToolError::io(dir.display(), e))?.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
             }
+            // An unreadable record is missing evidence, never an empty question list.
+            let bytes = std::fs::read(&path).map_err(|e| ToolError::io(path.display(), e))?;
+            let unknown = serde_json::from_slice::<Unknown>(&bytes)
+                .map_err(|e| ToolError::new(ErrorCode::BadSettings, format!("Could not read investigation question {}: {e}", path.display())))?;
+            out.push(unknown);
         }
         Ok(out)
     }

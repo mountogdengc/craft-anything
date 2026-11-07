@@ -1467,3 +1467,21 @@ About "{question}":	"{question}"에 관해:
 The project plan could not be read.	프로젝트 계획을 읽을 수 없습니다.
 Update the build plan	빌드 계획 업데이트
 Keep the project phases, missing information and checks together in one plan.	프로젝트 단계, 부족한 정보, 검사를 하나의 계획에 모아 둡니다.
+Choose what the builder's approvals get	빌더의 승인 요청을 어떻게 처리할지 고르기
+Reading the web	웹 읽기
+Other commands	그 밖의 명령
+Files outside the project	프로젝트 밖의 파일
+Pushing and publishing	푸시와 게시
+Deleting outside the project	프로젝트 밖 삭제
+System changes	시스템 변경
+Other tools	그 밖의 도구
+Allow	허용
+Ask	묻기
+Refuse	거부
+After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	/approvals 뒤에 종류와 allow, ask, refuse, default 중 하나를 입력합니다. 예: /approvals publish ask. 종류: {kinds}.
+There's no kind called {name}. Kinds: {kinds}.	{name}라는 종류는 없습니다. 종류: {kinds}.
+Approvals	승인
+In this project, {kind}: {choice}.	이 프로젝트에서 {kind}: {choice}.
+Couldn't change the approvals:	승인을 바꾸지 못했습니다:
+What the builder may do without asking you, in this project.	이 프로젝트에서 빌더가 묻지 않고 해도 되는 일입니다.
+Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	기본값은 자동 모드를 따릅니다. 켜져 있으면 되돌릴 수 있는 일은 진행하고 나머지는 거부하며, 꺼져 있으면 빌더가 묻습니다.
