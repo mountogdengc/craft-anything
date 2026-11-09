@@ -552,6 +552,10 @@ complete while required checks or planned work remain unresolved.
       preserving planned scope, incomplete previews and versioned project settings.
       — claimed: Codex, branch chore/upstream-integration-20261106
 
+- [ ] Isolate build planning in a Rust extension with its own versioned state and narrow host
+      hooks, migrate existing plans, then integrate the newer upstream changes.
+      — claimed: Codex, branch feature/r5.8-planning-extension-20261109
+
 - [x] Add versioned build plans with phases, required inputs, acceptance criteria, headless tools,
       builder integration and a project view; evaluate every final check and preserve an incomplete
       preview when verification fails — claimed: Codex, branch feature/r5.8-build-planning
