@@ -1216,6 +1216,7 @@ dependencies = [
  "craft-anything-evidence",
  "craft-anything-formats",
  "craft-anything-js",
+ "craft-anything-planning",
  "craft-anything-platform",
  "craft-anything-testkit",
  "dirs",
@@ -1282,6 +1283,7 @@ dependencies = [
  "rsa",
  "rustc-demangle",
  "ruzstd",
+ "semver",
  "serde",
  "serde_json",
  "sha1",
@@ -1319,6 +1321,18 @@ dependencies = [
  "craft-anything-evidence",
  "craft-anything-platform",
  "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "craft-anything-planning"
+version = "0.4.0"
+dependencies = [
+ "craft-anything-evidence",
+ "craft-anything-platform",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

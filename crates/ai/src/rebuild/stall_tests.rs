@@ -70,7 +70,7 @@ fn run_idle_builder(create_app_dir: bool) -> (ToolError, Vec<Vec<Msg>>) {
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(NeverBuilt));
     let opts = RunOptions { message: Some("Build the app".into()), kinds, max_rounds: 6, ..RunOptions::default() };
-    let error = worker.run(&mut ws, entry, Some(api), None, &opts).unwrap_err();
+    let error = worker.run(&mut ws, entry, Some(api), None, super::super::KeptHistory::default(), &opts).unwrap_err();
     let requests = seen.lock().unwrap().clone();
     (error, requests)
 }
@@ -146,7 +146,7 @@ fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Optio
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(NeverBuilt));
     let opts = RunOptions { message: message.map(str::to_string), continuing: message.is_none(), kinds, max_rounds: 6, ..RunOptions::default() };
-    match worker.run(ws, entry, Some(api), None, &opts) {
+    match worker.run(ws, entry, Some(api), None, KeptHistory::default(), &opts) {
         Ok(summary) => {
             assert_eq!(ws.manifest.status, Status::Incomplete);
             summary

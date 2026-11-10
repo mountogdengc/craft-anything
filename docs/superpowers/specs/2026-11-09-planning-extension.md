@@ -22,10 +22,16 @@ workflow features.
   existing investigation update lock. Always acquire the legacy lock before the extension lock
   when both are needed. Cancellation and lock deadlines remain effective.
 - Keep the existing UI panel and input-composer behavior, with background reads only.
+- Preserve planning without an open project through an engine session slot with its own revision.
+  Creating a project transfers that state and its evidence. Opening an existing project must not
+  overwrite it with unrelated session planning; an existing canonical or legacy plan wins.
 - Bring in the newer upstream history after extraction. Preserve session-mode isolation, check
   caching/deadlines, vision-aware builder guidance and parser/process fixes. Reconcile both
   historical format-4 project variants explicitly; do not reinterpret unknown session modes as
   permission to resume a Deep session in Clean room.
+- An unlabelled legacy builder session starts fresh and studies again in Clean room, preserving
+  files and plans. Deep mode may retain legacy continuation, matching upstream's conservative
+  reuse classification; this does not prove the session's historic mode or ask the person to infer it.
 - Keep local experiments ignored and preserve the primary checkout and the previous integration
   branch. Do not merge main. Prepare a new PR that supersedes the older integration PR once ready.
 
@@ -58,3 +64,5 @@ any broader check before running it. No live paid-provider, person-app capture, 
 required for this extraction.
 
 The sibling craftrules checkout remains unavailable. Follow the available project instructions.
+
+Synchronization snapshot: upstream `e09888e14641d71eca7951ac6248fa207b16881a`.

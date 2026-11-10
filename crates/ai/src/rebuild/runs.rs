@@ -218,9 +218,10 @@ impl RunSet {
 
 /// Poll `set` every `every` on a background thread while runs wait, so queued runs start as
 /// soon as a place comes free: for holders that poll only when called (the rebuild tools, which
-/// an MCP client may not call again for a while). One thread per set at a time; it ends when the
-/// queue is empty or the engine is gone, and never waits on a busy session.
-pub fn keep_queue_moving(set: &Arc<Mutex<RunSet>>, engine: &Arc<Engine>, every: Duration) {
+/// an MCP client may not call again for a while). `settings_path` is the session's config file,
+/// read when the session is busy. One thread per set at a time; it ends when the queue is empty
+/// or the engine is gone, and never waits on a busy session.
+pub fn keep_queue_moving(set: &Arc<Mutex<RunSet>>, engine: &Arc<Engine>, settings_path: PathBuf, every: Duration) {
     {
         let mut s = set.lock().unwrap_or_else(PoisonError::into_inner);
         if s.watched || s.queue.is_empty() {
@@ -242,7 +243,8 @@ pub fn keep_queue_moving(set: &Arc<Mutex<RunSet>>, engine: &Arc<Engine>, every: 
                 s.set_limit(session.settings.build.parallel);
             }
             // Each run keeps its own project's feed, so the events aren't needed here.
-            let _ = s.poll(&AiHub::new(engine));
+            let hub = AiHub::with_stores(engine, settings_path.clone(), crate::KeyStore::system());
+            let _ = s.poll(&hub);
             if s.queue.is_empty() {
                 s.watched = false;
                 return;
@@ -419,14 +421,15 @@ mod tests {
         let b = Workspace::create(d.path(), "B", "A game", TargetRef::None).unwrap();
         let fake = StandIns::new();
         let hub = hub();
+        let settings_path = hub.engine.session().config_dir().join("config.toml");
         let set = Arc::new(Mutex::new(RunSet::new(1).with_starter(fake.starter())));
         set.lock().unwrap().start(&hub, a.clone(), RunOptions::default()).unwrap();
         // Nothing waits yet, so no thread is started.
-        keep_queue_moving(&set, &hub.engine, Duration::from_millis(5));
+        keep_queue_moving(&set, &hub.engine, settings_path.clone(), Duration::from_millis(5));
         assert!(!set.lock().unwrap().watched);
         set.lock().unwrap().start(&hub, b.clone(), RunOptions::default()).unwrap();
-        keep_queue_moving(&set, &hub.engine, Duration::from_millis(5));
-        keep_queue_moving(&set, &hub.engine, Duration::from_millis(5));
+        keep_queue_moving(&set, &hub.engine, settings_path.clone(), Duration::from_millis(5));
+        keep_queue_moving(&set, &hub.engine, settings_path, Duration::from_millis(5));
         assert!(set.lock().unwrap().watched);
         fake.finish(&a.root);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

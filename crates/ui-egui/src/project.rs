@@ -154,6 +154,7 @@ impl CraftApp {
             kinds: self.kinds.clone(),
             max_rounds: build.max_rounds,
             good_enough: build.good_enough,
+            clean_room: Some(!self.settings.deep_mode),
             ..RunOptions::default()
         }
     }
@@ -755,8 +756,8 @@ impl Facts {
     pub fn read(ws: &Workspace, godot: Option<&Path>, good_enough: f64) -> Facts {
         let dir = ws.app_dir();
         let a = ws.assets();
-        let saved_plan = craft_anything_engine::tools::investigation_tools::load_project_strict(&ws.investigation_dir()).and_then(|investigation| {
-            let Some(plan) = investigation.build_plan else { return Ok(None) };
+        let saved_plan = craft_anything_engine::extensions::planning::load_project_strict(&ws.investigation_dir()).and_then(|state| {
+            let Some(plan) = state.plan else { return Ok(None) };
             // The UI's workspace is a snapshot from before this run. Checks are saved between
             // rounds, so read them here on the worker before displaying a criterion as verified.
             let current = Workspace::open(&ws.root)?;
@@ -1196,16 +1197,27 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
     });
 }
 
-/// A caption on the left and its value on the right.
+/// A caption on the left and its value on the right, or the value on a line of its own when the
+/// two would overlap: a right-to-left layout doesn't make room for what's already on the row.
 fn stat_row(ui: &mut Ui, label: &str, value: &str) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    ui.horizontal(|ui| {
-        widgets::caption(ui, label);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).font(theme::mono(13.0)).color(t.text));
-        });
-    })
-    .response
+    let text = RichText::new(value).font(theme::mono(13.0)).color(t.text);
+    let value_width =
+        egui::WidgetText::from(text.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default).size().x;
+    let caption_width = widgets::label_galley(ui, &tr(label), 12.0, t.text_faint).size().x;
+    if caption_width + ui.spacing().item_spacing.x + value_width <= ui.available_width() {
+        ui.horizontal(|ui| {
+            widgets::caption(ui, label);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(text));
+        })
+        .response
+    } else {
+        ui.vertical(|ui| {
+            widgets::caption(ui, label);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| ui.label(text));
+        })
+        .response
+    }
 }
 
 fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {

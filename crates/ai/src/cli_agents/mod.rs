@@ -10,8 +10,10 @@
 
 pub mod acp;
 pub mod adapters;
+pub mod claude_cost;
 pub mod models;
 mod shared;
+pub mod unfinished;
 
 pub(crate) use shared::SharedConversation;
 
@@ -42,6 +44,7 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("claude-code", "claude", "Claude Code"),
     ("codex", "codex", "Codex"),
     ("copilot", "copilot", "GitHub Copilot"),
+    ("grok", "grok", "Grok Build"),
     ("gemini-cli", "gemini", "Gemini CLI"),
     ("antigravity", "agy", "Antigravity"),
     ("opencode", "opencode", "OpenCode"),
@@ -49,7 +52,9 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("qwen-code", "qwen", "Qwen Code"),
     ("goose", "goose", "Goose"),
     ("maki", "maki", "Maki"),
+    ("aider", "aider", "Aider"),
     ("dsh", "dsh", "DeepSeek Harness"),
+    ("devin", "devin", "Devin"),
 ];
 
 pub fn program_for(agent: &str) -> String {
@@ -66,6 +71,14 @@ pub fn program_of(config: &BackendConfig, options: &BackendOptions) -> Result<St
     program_in(config, options, craft_anything_platform::which::search_path())
 }
 
+/// The saved program path `program` stands in for, when [`program_of`] chose another one (#721).
+/// A bare name (`claude.exe`) found as the same agent elsewhere isn't a replacement.
+pub fn replaced_program(options: &BackendOptions, program: &str) -> Option<String> {
+    let saved = options.command.as_deref().map(str::trim).filter(|c| !c.is_empty() && *c != program)?;
+    Path::new(saved).parent().is_some_and(|p| !p.as_os_str().is_empty()).then(|| saved.to_string())
+}
+
+/// Resolve saved commands locally through the shared lookup, but leave SSH commands untouched.
 fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<std::ffi::OsString>) -> Result<String, ToolError> {
     let usual = program_for(&config.model);
     let local = config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
@@ -82,14 +95,25 @@ fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<s
     // A saved `claude`, by name or as the desktop app's own file, is looked up as the usual one is,
     // so it never starts the desktop app.
     let named_claude = bare && path.file_stem().is_some_and(|s| s.eq_ignore_ascii_case(&usual));
-    if local && usual == "claude" && (named_claude || is_claude_desktop(path)) {
+    if local && usual == "claude" && (named_claude || leads_to_claude_desktop(path)) {
+        // A name saved on purpose (`claude.cmd`, a wrapper) is kept when it starts Claude Code itself.
+        if named_claude
+            && let Some(found) = craft_anything_platform::which::which_in(chosen, search.clone()).into_iter().next()
+            && !leads_to_claude_desktop(&found)
+        {
+            return Ok(chosen.to_string());
+        }
         return match usual_program(&usual, search)? {
             Some(program) => Ok(program),
             None if bare => Ok(chosen.to_string()),
             None => Err(desktop_app_error(path)),
         };
     }
-    if !local || bare || path.exists() {
+    // Saved bare names share detection's desktop-CLI fallback, whichever agent owns it.
+    if local && bare {
+        return Ok(usual_program(chosen, search)?.unwrap_or_else(|| chosen.to_string()));
+    }
+    if !local || path.exists() {
         return Ok(chosen.to_string());
     }
     // Gone, and nothing beside it: the usual program if it's really here, else the saved path, so
@@ -103,7 +127,7 @@ fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<s
 fn usual_program(usual: &str, search: Option<std::ffi::OsString>) -> Result<Option<String>, ToolError> {
     let first = craft_anything_platform::which::which_in(usual, search.clone()).into_iter().next();
     match (first, find_program_in(usual, search)) {
-        (None, _) => Ok(None),
+        (None, _) => Ok(local_desktop_cli(usual).map(|cli| cli.display().to_string())),
         (Some(first), Some(real)) => Ok(Some(if first == real { usual.to_string() } else { real.display().to_string() })),
         (Some(app), None) => Err(desktop_app_error(&app)),
     }
@@ -121,11 +145,64 @@ fn desktop_app_error(app: &Path) -> ToolError {
 /// really it. Detection, the desktop app hint and starting a run all look through this, so what's
 /// offered is what runs.
 pub fn find_program(program: &str) -> Option<PathBuf> {
-    find_program_in(program, craft_anything_platform::which::search_path())
+    find_program_in(program, craft_anything_platform::which::search_path()).or_else(|| local_desktop_cli(program))
+}
+
+/// Off-PATH desktop CLI locations stay here, not in backend tests or command selection.
+fn local_desktop_cli(program: &str) -> Option<PathBuf> {
+    let windows = desktop_cli(program, local_app_data().as_deref());
+    #[cfg(target_os = "macos")]
+    if windows.is_none() && program == "codex" {
+        let roots = dirs::home_dir().map(|home| home.join("Applications")).into_iter().chain([PathBuf::from("/Applications")]);
+        return macos_codex_in(roots);
+    }
+    windows
+}
+
+/// Dock launches do not inherit a terminal's PATH. Look only in known app-bundle locations,
+/// never run an app's GUI executable as a CLI, and leave an explicit/PATH installation first.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn macos_codex_in(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    const INSIDE: &[&str] = &[
+        "ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        "ChatGPT.app/Contents/Resources/codex",
+        "Codex.app/Contents/Resources/codex",
+        "Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    ];
+    roots.into_iter().flat_map(|root| INSIDE.iter().map(move |inside| root.join(inside))).find(|path| {
+        let Ok(meta) = std::fs::metadata(path) else { return false };
+        if !meta.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        }
+    })
+}
+
+/// Agents whose Windows desktop app keeps the command-line program in its own folder, under
+/// another name and off the search path, relative to `%LOCALAPPDATA%` (#1060).
+const IN_DESKTOP_APP: &[(&str, &str)] = &[("opencode", r"Programs\ai.opencode.desktop\resources\opencode-cli.exe")];
+
+fn local_app_data() -> Option<PathBuf> {
+    cfg!(windows).then(|| std::env::var_os("LOCALAPPDATA")).flatten().map(PathBuf::from)
+}
+
+/// `program`'s command-line program inside its desktop app, if that's installed under `local_data`.
+fn desktop_cli(program: &str, local_data: Option<&Path>) -> Option<PathBuf> {
+    let (_, inside) = IN_DESKTOP_APP.iter().find(|(name, _)| *name == program)?;
+    Some(local_data?.join(inside)).filter(|cli| cli.is_file())
 }
 
 fn find_program_in(program: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    craft_anything_platform::which::which_in(program, path).into_iter().find(|p| program != "claude" || !is_claude_desktop(p))
+    craft_anything_platform::which::which_in(program, path).into_iter().find(|p| program != "claude" || !leads_to_claude_desktop(p))
+}
+
+/// [`is_claude_desktop`] for the file itself or, when it's a link, the file it leads to.
+fn leads_to_claude_desktop(path: &Path) -> bool {
+    is_claude_desktop(path) || std::fs::canonicalize(path).is_ok_and(|target| is_claude_desktop(&target))
 }
 
 /// A file inside the Claude desktop app, which can't build: its older installer names the app
@@ -220,13 +297,13 @@ pub fn cli_can_start(cli: Option<&Path>, stop: &CancelToken) -> Result<(), ToolE
     }
 }
 
-/// Whether a local build by `agent` can have our tool server: over ACP every agent is handed it,
-/// else its adapter says.
-pub fn check_builder_tools(adapter: &dyn AgentAdapter, agent: &str, options: &BackendOptions, stop: &CancelToken) -> Result<(), ToolError> {
+/// Whether a local build by `agent` in `cwd` can have our tool server: over ACP every agent is
+/// handed it, else its adapter says.
+pub fn check_builder_tools(adapter: &dyn AgentAdapter, agent: &str, options: &BackendOptions, cwd: &Path, stop: &CancelToken) -> Result<(), ToolError> {
     if selected_acp_args(adapter, agent, options).is_some() {
         return cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop);
     }
-    adapter.check_native_options(options)?;
+    adapter.check_native_options(options, Some(cwd))?;
     adapter.check_tool_server(stop)
 }
 
@@ -409,6 +486,10 @@ fn standalone(program: &str) -> Process {
 pub struct StreamParser {
     adapter: Arc<dyn AgentAdapter>,
     pub session_id: Option<String>,
+    /// The agent's own session for this run, kept even when it can't be resumed
+    /// ([`AgentAdapter::resumes`]), so a turn that doesn't finish can be cleaned up
+    /// ([`AgentAdapter::discard_unfinished`]).
+    pub run_session: Option<String>,
     pub tool_names: HashMap<String, String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -458,6 +539,7 @@ impl StreamParser {
         StreamParser {
             adapter,
             session_id: None,
+            run_session: None,
             tool_names: HashMap::new(),
             input_tokens: 0,
             output_tokens: 0,
@@ -525,6 +607,12 @@ pub struct CliSpec {
     pub question: bool,
     /// Where a failed run writes what's known about it ([`crate::failure_log`]). None writes no log.
     pub logs: Option<PathBuf>,
+    /// The backend's stored API key, for an ACP agent that asks the host to authenticate before a
+    /// session opens (Devin). None for agents that sign in some other way.
+    pub key: Option<String>,
+    /// Where Claude Code's session costs are kept, so a resumed turn's cost is what it added
+    /// ([`claude_cost`]). None: a resumed turn has no cost.
+    pub cost_totals: Option<PathBuf>,
 }
 
 /// What a building run needs besides the working folder.
@@ -570,8 +658,10 @@ impl CliSpec {
             deep: false,
             preamble: None,
             logs: None,
+            cost_totals: None,
             adapters: AgentAdapters::built_in(),
             question: false,
+            key: None,
         }
     }
 }
@@ -611,29 +701,32 @@ fn acp_for(spec: &CliSpec) -> Option<AcpConversation> {
     let acp_args = selected_acp_args(adapter.as_ref(), &agent, &spec.options).filter(|_| local)?;
     // No program to start: the plain run reports why.
     let program = program_of(&spec.config, &spec.options).ok()?;
-    let access = match (spec.question, spec.deep, spec.builder.is_some()) {
-        (true, true, _) => Access::Question,
-        (true, false, _) => Access::CleanRoomQuestion,
-        (false, true, true) => Access::Build,
-        (false, false, true) => Access::CleanRoomBuild,
-        _ => Access::Analyse,
-    };
+    // Same modes as the plain runner, including Clean room chat (no builder, not deep).
+    let access = access_for(spec.builder.is_some(), spec.deep, spec.question);
     let mut args = adapter.acp_options(&spec.options, access);
     args.extend(acp_args.iter().map(|a| a.to_string()));
     args.extend(acp::model_args(&agent, spec.options.cli_model.as_deref()));
+    // After the mode words and model flag, still before a trailing subcommand (`stdio` for Grok).
+    args.extend(adapter.acp_mode_options(&spec.options, access));
     let cwd = spec.project.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_else(std::env::temp_dir);
     let mcp = mcp_for(spec, false);
     if !spec.question {
         args.extend(adapter.acp_mcp_options(&mcp));
     }
+    args.extend(adapter.acp_trailing().iter().map(|word| (*word).to_string()));
     let preamble = spec.preamble.clone().unwrap_or_else(|| crate::prompt::cli_preamble(spec.beginner));
+    let session_config = adapter.acp_session_config(&spec.options);
+    let auth = acp::key_auth_method(&agent).map(str::to_string).zip(spec.key.clone());
     Some(
         AcpConversation::new(&spec.config.name, &agent, program, args, cwd, mcp, if spec.question { None } else { spec.resume.clone() })
             .with_validation(adapter.validate_options(&spec.options))
+            .with_access_limit(adapter.validate_access(access))
             .with_adapter(adapter)
             .with_question(spec.question)
+            .with_session_config(session_config)
             .with_preamble(preamble)
-            .with_logs(spec.logs.clone()),
+            .with_logs(spec.logs.clone())
+            .with_auth(auth),
     )
 }
 
@@ -837,7 +930,9 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         });
         return nothing_done(&name);
     }
-    if let Err(e) = adapter.check_native_options(&spec.options) {
+    // The folder the agent's process starts in below.
+    let cwd = remote.is_none().then(|| spec.project.clone().or_else(|| std::env::current_dir().ok())).flatten();
+    if let Err(e) = adapter.check_native_options(&spec.options, cwd.as_deref()) {
         let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
         return nothing_done(&name);
     }
@@ -918,6 +1013,22 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     };
     let _ =
         tx.send(AgentEvent::Status { text: format!("Asking {}{}…", display_for(&agent), remote.as_ref().map(|h| format!(" on {h}")).unwrap_or_default()) });
+    // Sessions earlier turns left behind when Craft Anything was killed mid-turn (#1115). Off this
+    // thread: a delete over SSH may wait on a host that's away.
+    let records = spec.logs.as_deref().map(unfinished::dir_in);
+    if let Some(dir) = records.clone() {
+        let (adapters, tx3) = (spec.adapters.clone(), tx.clone());
+        let _ = std::thread::Builder::new().name("unfinished-sessions".into()).spawn(move || {
+            for text in unfinished::sweep(&dir, &adapters) {
+                let _ = tx3.send(AgentEvent::Status { text });
+            }
+        });
+    }
+    // This turn's own session, recorded once the agent names it, for a sweep if we're killed.
+    let records = records.filter(|_| adapter.discards_sessions());
+    // Some once tried, recorded or not.
+    let held: Arc<Mutex<Option<Option<unfinished::Held>>>> = Arc::new(Mutex::new(None));
+    let (held2, agent2, program2, host2) = (held.clone(), agent.clone(), program.clone(), remote.clone());
     let parser = Arc::new(Mutex::new(StreamParser::new(adapter.clone())));
     let (p2, tx2, tx_err, lost2, failure2) = (parser.clone(), tx.clone(), tx.clone(), lost.clone(), failure.clone());
     let failed_tools = Arc::new(AtomicBool::new(false));
@@ -939,6 +1050,12 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
             }
             let mut p = p2.lock().unwrap_or_else(PoisonError::into_inner);
             let events = p.line(l);
+            if let (Some(dir), Some(id)) = (&records, &p.run_session) {
+                let mut h = held2.lock().unwrap_or_else(PoisonError::into_inner);
+                if h.is_none() {
+                    *h = Some(unfinished::Held::record(dir, &unfinished::Entry::new(&agent2, &program2, host2.as_deref(), id)).ok());
+                }
+            }
             // Said before the error that follows it, so whoever reads the error can tell.
             if p.session_missing {
                 lost2.store(true, Ordering::SeqCst);
@@ -981,6 +1098,10 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         };
         *failure.lock().unwrap_or_else(PoisonError::into_inner) = failed;
     }
+    let unfinished = match &result {
+        Ok(out) => !out.success,
+        Err(_) => true,
+    };
     match result {
         // The protocol already named the required tool server. Stop the owned process without
         // replacing that useful error with the cancellation used to stop it.
@@ -1012,7 +1133,32 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
             let _ = tx.send(shown.error_event(&agent, e));
         }
     }
-    AgentEvent::TurnDone { backend: name, input_tokens: p.input_tokens, output_tokens: p.output_tokens, cost_usd: p.cost_usd, cost_is_estimate: true }
+    // #1115: a turn that didn't finish leaves its session marked as running, and the agent's
+    // background service may pick it up later and carry on with nobody watching.
+    let held = held.lock().unwrap_or_else(PoisonError::into_inner).take().flatten();
+    let gone = match &p.run_session {
+        Some(id) if unfinished => match adapter.discard_unfinished(&program, id, remote.as_deref()) {
+            Ok(()) => true,
+            Err(e) => {
+                let fix = e.remediation.map(|r| format!(" {r}")).unwrap_or_default();
+                let _ = tx.send(AgentEvent::Status { text: format!("Couldn't remove {}'s unfinished session {id}: {}.{fix}", display_for(&agent), e.message) });
+                false
+            }
+        },
+        _ => true,
+    };
+    // Kept (unlocked) when the delete failed, so a later sweep tries again.
+    if gone && let Some(h) = held {
+        h.done();
+    }
+    // Claude Code's total is the session's running total (#1187); a question's copy is answered by
+    // question.rs, which keeps no cost for it.
+    let cost_usd = if adapter.ids().contains(&"claude-code") && !spec.question {
+        claude_cost::turn_cost(spec.cost_totals.as_deref(), resume.as_deref(), p.session_id.as_deref(), p.cost_usd)
+    } else {
+        p.cost_usd
+    };
+    AgentEvent::TurnDone { backend: name, input_tokens: p.input_tokens, output_tokens: p.output_tokens, cost_usd, cost_is_estimate: true }
 }
 
 /// What's needed to explain a failed CLI run: the command with the person's message left out, and
@@ -1205,6 +1351,12 @@ mod tests {
         let chosen = |p: &Path| BackendOptions { command: Some(p.display().to_string()), ..Default::default() };
         assert_eq!(program_of(&config(None), &chosen(&gone)).unwrap(), new.display().to_string(), "the same file in the newer build folder");
         assert_eq!(program_of(&config(None), &chosen(&new)).unwrap(), new.display().to_string(), "a path that's there is used as it is");
+        let program = program_of(&config(None), &chosen(&gone)).unwrap();
+        assert_eq!(replaced_program(&chosen(&gone), &program), Some(gone.display().to_string()), "the gone path is named");
+        assert_eq!(replaced_program(&chosen(&new), &new.display().to_string()), None, "nothing replaced");
+        assert_eq!(replaced_program(&BackendOptions::default(), "codex"), None, "nothing saved");
+        let bare = BackendOptions { command: Some("claude.exe".into()), ..Default::default() };
+        assert_eq!(replaced_program(&bare, "claude"), None, "a bare name found as the same agent");
         assert_eq!(program_of(&config(Some("box")), &chosen(&gone)).unwrap(), gone.display().to_string(), "another computer's path isn't checked here");
         assert_eq!(program_of(&config(None), &BackendOptions::default()).unwrap(), "codex", "nothing chosen: the usual name");
         // #467: a saved app bundle is never started; the usual name is looked up instead.
@@ -1272,7 +1424,7 @@ mod tests {
         let saved = |c: &str| BackendOptions { command: Some(c.into()), ..Default::default() };
         let (by_name, the_app) = (saved(file), saved(&app.display().to_string()));
         assert_eq!(program_in(&claude, &by_name, path(&[app_dir, cli_dir])).unwrap(), real, "a saved name, the app first");
-        assert_eq!(program_in(&claude, &by_name, path(&[cli_dir, app_dir])).unwrap(), "claude", "a saved name that starts the real one");
+        assert_eq!(program_in(&claude, &by_name, path(&[cli_dir, app_dir])).unwrap(), file, "a saved name that starts the real one is kept");
         assert_eq!(program_in(&claude, &by_name, path(&[app_dir])).unwrap_err().code, ErrorCode::EngineMissing);
         assert_eq!(program_in(&claude, &by_name, path(&[])).unwrap(), file, "nothing found: the saved name, so the run says so");
         assert_eq!(program_in(&claude, &the_app, path(&[app_dir, cli_dir])).unwrap(), real, "the app's own file saved: the real one");
@@ -1280,6 +1432,34 @@ mod tests {
         assert!(err.code == ErrorCode::EngineMissing && err.message.contains("desktop app"), "{}", err.message);
         let saved_cli = saved(&cli.display().to_string());
         assert_eq!(program_in(&claude, &saved_cli, path(&[app_dir])).unwrap(), real, "a saved real path is kept");
+        // A wrapper saved by name (`claude.cmd`) stays, though another real `claude` comes first
+        // (review of #1036).
+        let wrapper = d.path().join("wrap").join(if cfg!(windows) { "claude.cmd" } else { "claude.sh" });
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, b"").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let wrapper_name = wrapper.file_name().unwrap().to_string_lossy().to_string();
+        let wrap_dir = wrapper.parent().unwrap();
+        assert_eq!(program_in(&claude, &saved(&wrapper_name), path(&[cli_dir, wrap_dir])).unwrap(), wrapper_name);
+        assert_eq!(program_in(&claude, &saved(&wrapper_name), path(&[app_dir, wrap_dir])).unwrap(), wrapper_name, "the app doesn't hide it");
+        // A link to the desktop app is the desktop app (review of #1036). Making a link may need
+        // rights Windows doesn't give everyone; then there's nothing to check.
+        let link_dir = d.path().join("links");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join(file);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&app, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&app, &link).is_ok();
+        if made {
+            assert_eq!(find_program_in("claude", path(&[&link_dir, cli_dir])), Some(cli.clone()), "the link is passed over");
+            assert_eq!(program_in(&claude, &none, path(&[&link_dir, cli_dir])).unwrap(), real);
+            assert_eq!(program_in(&claude, &none, path(&[&link_dir])).unwrap_err().code, ErrorCode::EngineMissing);
+            let saved_link = saved(&link.display().to_string());
+            assert_eq!(program_in(&claude, &saved_link, path(&[cli_dir])).unwrap(), "claude", "a saved link to the app: the name starts the real one");
+            assert_eq!(program_in(&claude, &saved_link, path(&[app_dir, cli_dir])).unwrap(), real, "a saved link to the app, the app first");
+        }
         // Another agent's program in such a folder is only filtered for Claude.
         let other = app_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
         std::fs::write(&other, b"").unwrap();
@@ -1442,11 +1622,185 @@ mod tests {
             for acp in [false, true] {
                 let options = BackendOptions { cli_model: model.map(str::to_string), cli_thinking: thinking, acp: Some(acp), ..Default::default() };
                 assert!(selected_acp_args(adapter.as_ref(), "opencode", &options).is_none());
-                assert!(adapter.check_native_options(&options).is_ok());
+                assert!(adapter.check_native_options(&options, None).is_ok());
             }
         }
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec![], notes: None };
         assert!(adapter.mcp_env(&mcp).unwrap().is_some());
+    }
+
+    /// Reject non-executable candidates and prefer the user's application installation.
+    #[cfg(unix)]
+    #[test]
+    fn macos_bundled_codex_needs_an_executable_and_respects_application_root_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let user = d.path().join("User Applications");
+        let system = d.path().join("Applications");
+        let relative = "ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+        let user_cli = user.join(relative);
+        let system_cli = system.join("Codex.app/Contents/Resources/codex");
+        assert!(macos_codex_in([user.clone(), system.clone()]).is_none());
+        std::fs::create_dir_all(user_cli.parent().unwrap()).unwrap();
+        std::fs::write(&user_cli, b"not executable").unwrap();
+        std::fs::set_permissions(&user_cli, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(macos_codex_in([user.clone()]).is_none());
+        std::fs::create_dir_all(system_cli.parent().unwrap()).unwrap();
+        std::fs::write(&system_cli, b"stand-in").unwrap();
+        std::fs::set_permissions(&system_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(macos_codex_in([user.clone(), system.clone()]), Some(system_cli));
+        std::fs::set_permissions(&user_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(macos_codex_in([user, system]), Some(user_cli));
+    }
+
+    /// Every supported bundle accepts its CLI, never its GUI or a directory at the CLI path.
+    #[cfg(unix)]
+    #[test]
+    fn every_supported_macos_codex_bundle_layout_is_found_without_the_gui() {
+        use std::os::unix::fs::PermissionsExt;
+        for relative in [
+            "ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "ChatGPT.app/Contents/Resources/codex",
+            "Codex.app/Contents/Resources/codex",
+            "Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let cli = d.path().join(relative);
+            std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+            // A directory and an app GUI executable are never CLI candidates.
+            std::fs::create_dir_all(&cli).unwrap();
+            assert!(macos_codex_in([d.path().into()]).is_none());
+            std::fs::remove_dir(&cli).unwrap();
+            let gui = d.path().join("ChatGPT.app/Contents/MacOS/ChatGPT");
+            std::fs::create_dir_all(gui.parent().unwrap()).unwrap();
+            std::fs::write(&gui, b"stand-in GUI, never run").unwrap();
+            std::fs::set_permissions(&gui, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(macos_codex_in([d.path().into()]).is_none());
+            std::fs::write(&cli, b"stand-in CLI, never run").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(macos_codex_in([d.path().into()]), Some(cli));
+        }
+    }
+
+    /// Saved usual names share desktop lookup for every agent, while SSH names remain remote.
+    #[test]
+    fn saved_bare_agent_names_share_the_usual_lookup() {
+        let empty = std::env::join_paths(std::iter::empty::<&Path>()).ok();
+        for (model, program, _) in KNOWN {
+            let mut config =
+                BackendConfig { name: "Agent test".into(), kind: BackendKind::AgentCli, model: (*model).into(), base_url: None, ssh_host: None, enabled: true };
+            let options = BackendOptions { command: Some((*program).into()), ..Default::default() };
+            assert_eq!(
+                program_in(&config, &options, empty.clone()).unwrap(),
+                program_in(&config, &BackendOptions::default(), empty.clone()).unwrap(),
+                "{model}"
+            );
+            config.ssh_host = Some("test-host".into());
+            assert_eq!(program_in(&config, &options, empty.clone()).unwrap(), *program, "SSH never resolves a local desktop CLI");
+        }
+    }
+
+    /// #1060: OpenCode's desktop app keeps its CLI in its own folder, as `opencode-cli.exe`.
+    #[test]
+    fn a_cli_inside_its_desktop_app_is_found() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(desktop_cli("opencode", Some(d.path())), None, "not installed");
+        assert_eq!(desktop_cli("opencode", None), None, "not Windows");
+        let cli = d.path().join(IN_DESKTOP_APP[0].1);
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, b"").unwrap();
+        assert_eq!(desktop_cli("opencode", Some(d.path())), Some(cli));
+        assert_eq!(desktop_cli("codex", Some(d.path())), None, "only the agents listed");
+    }
+
+    const UNFINISHED_CHILD_ENV: &str = "CRAFT_ANYTHING_TEST_UNFINISHED_CHILD";
+
+    /// The stand-in agent of `a_stopped_turn_discards_its_session`: it names its session in
+    /// OpenCode's format, then finishes or hangs as told. Run as an ordinary test, it does nothing.
+    #[test]
+    fn unfinished_child() {
+        let Some(how) = std::env::var_os(UNFINISHED_CHILD_ENV) else { return };
+        // On a line of its own: libtest has already written "test … ... " without a line break.
+        println!("\n{}", json!({"type":"text","sessionID":"ses_child","part":{"text":"working"}}));
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        if how == "hang" {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// #1115: a turn stopped part-way removes the session it started, so the agent's background
+    /// service can't pick it up again; a turn that finishes leaves its session alone.
+    #[test]
+    fn a_stopped_turn_discards_its_session() {
+        struct StandIn {
+            how: &'static str,
+            discarded: Arc<Mutex<Vec<String>>>,
+        }
+        impl AgentAdapter for StandIn {
+            /// Register the fixture without replacing any built-in agent.
+            fn ids(&self) -> &'static [&'static str] {
+                &["test-unfinished"]
+            }
+            /// Run only `unfinished_child` in this test program.
+            fn args(&self, _cx: &ArgsCx) -> Vec<String> {
+                ["--exact", "--test-threads=1", "--nocapture", "cli_agents::tests::unfinished_child"].map(String::from).to_vec()
+            }
+            fn streams_json(&self) -> bool {
+                true
+            }
+            /// Tell the child how to behave (the runner hands the agent this variable).
+            fn mcp_env(&self, _mcp: &McpCommand) -> Result<Option<(&'static str, String)>, ToolError> {
+                Ok(Some((UNFINISHED_CHILD_ENV, self.how.to_string())))
+            }
+            /// Read the stream as OpenCode's adapter does.
+            fn parse(&self, p: &mut StreamParser, v: &Value) -> Vec<AgentEvent> {
+                adapters::OpenCode.parse(p, v)
+            }
+            /// It stands in for an agent whose sessions are deleted.
+            fn discards_sessions(&self) -> bool {
+                true
+            }
+            /// Record what would be deleted.
+            fn discard_unfinished(&self, _program: &str, id: &str, _host: Option<&str>) -> Result<(), ToolError> {
+                self.discarded.lock().unwrap_or_else(PoisonError::into_inner).push(id.to_string());
+                Ok(())
+            }
+        }
+        for (how, stopped) in [("hang", true), ("finish", false)] {
+            let discarded = Arc::new(Mutex::new(Vec::new()));
+            let config = BackendConfig {
+                name: "Test".into(),
+                kind: BackendKind::AgentCli,
+                model: "test-unfinished".into(),
+                base_url: None,
+                ssh_host: None,
+                enabled: true,
+            };
+            let options = BackendOptions { command: Some(std::env::current_exe().unwrap().display().to_string()), ..Default::default() };
+            let mut spec = CliSpec::new(config, options, false, None);
+            let logs = tempfile::tempdir().unwrap();
+            spec.logs = Some(logs.path().to_path_buf());
+            spec.adapters.register(Arc::new(StandIn { how, discarded: discarded.clone() }));
+            let mut c = CliConversation::new(spec);
+            c.send("go");
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut all = Vec::new();
+            while !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                assert!(std::time::Instant::now() < deadline, "{how}: no TurnDone: {all:?}");
+                let got = c.poll();
+                // Stopped once it's working, as Pause does.
+                if stopped && got.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })) {
+                    c.stop();
+                }
+                all.extend(got);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let want: &[&str] = if stopped { &["ses_child"] } else { &[] };
+            assert_eq!(*discarded.lock().unwrap_or_else(PoisonError::into_inner), want, "{how}: {all:?}");
+            // Its record of the session goes once the session is deleted or finished.
+            let left = std::fs::read_dir(unfinished::dir_in(logs.path())).map(|rd| rd.flatten().count());
+            assert_eq!(left.ok(), Some(0), "{how}: the session was recorded, then its record removed");
+        }
     }
 
     /// Validation failures finish exactly once, preserving cancellation status and other error details.
@@ -1521,6 +1875,8 @@ mod tests {
             let tools = &builder[builder_pos + 1];
             assert!(tools.split(',').any(|tool| tool == "Bash"), "{access:?}: {tools}");
             assert!(tools.split(',').any(|tool| tool == "Write"), "{access:?}: {tools}");
+            // #1105: a Deep builder can start subagents; Clean room keeps them out.
+            assert_eq!(tools.split(',').any(|tool| tool == "Agent"), access == Access::Build, "{access:?}: {tools}");
         }
         assert_eq!(a[pos("--resume") + 1], "sess-1");
         assert_eq!(a[pos("--allowedTools") + 1], "mcp__craft-anything__*");
@@ -1602,7 +1958,7 @@ mod tests {
         let g = build_args(adapter_for("gemini-cli").as_ref(), &BackendOptions::default(), "q", "", &mcp(), None, Access::Analyse);
         assert!(g.windows(2).any(|w| w[0] == "--output-format" && w[1] == "stream-json"));
         let o = BackendOptions { args: vec!["run".into()], ..Default::default() };
-        assert_eq!(build_args(adapter_for("aider").as_ref(), &o, "q", "", &mcp(), None, Access::Analyse), vec!["run".to_string(), "q".to_string()]);
+        assert_eq!(build_args(adapter_for("no-such-agent").as_ref(), &o, "q", "", &mcp(), None, Access::Analyse), vec!["run".to_string(), "q".to_string()]);
     }
 
     #[test]
@@ -1981,6 +2337,7 @@ mod tests {
         assert!(adapter_for("claude-code").handoff(&saved, 10_000).is_some() && adapter_for("codex").handoff(&saved, 10_000).is_none());
     }
 
+    /// Native stream events preserve text, tool results and usage for both adapters.
     #[test]
     fn parses_codex_and_gemini_streams() {
         let mut p = StreamParser::new(adapter_for("codex"));
@@ -1998,6 +2355,8 @@ mod tests {
         assert!(matches!(&ev[1], AgentEvent::ToolFinished { ok: true, .. }));
         assert!(matches!(&ev[2], AgentEvent::TextDelta { text } if text.starts_with("It lists")));
         assert!(p.saw_result && p.output_tokens == 4);
+        let auth = p.line(&json!({"type":"turn.failed","error":{"message":"authentication expired"}}).to_string());
+        assert!(auth.iter().any(|event| matches!(event, AgentEvent::Error { remediation: Some(fix), .. } if fix.contains("Sign in with ChatGPT"))));
         let mut g = StreamParser::new(adapter_for("gemini-cli"));
         let ev: Vec<_> = [
             json!({"type":"message","role":"assistant","content":"Hi","delta":true}),
@@ -2009,6 +2368,34 @@ mod tests {
         .collect();
         assert!(matches!(&ev[1], AgentEvent::ToolStarted { tool, .. } if tool == "core_targets_list"));
         assert!(matches!(&ev[2], AgentEvent::ToolFinished { ok: false, .. }));
+    }
+
+    /// Login-shell, tool and network failures are not evidence that the account needs sign-in.
+    #[test]
+    fn codex_sign_in_guidance_only_matches_authentication_failures() {
+        for kind in ["turn.failed", "error"] {
+            for (message, needs_login) in [
+                ("login required", true),
+                ("Authentication expired", true),
+                ("authentication failed", true),
+                ("authentication required", true),
+                ("Unauthorized", true),
+                ("not logged in", true),
+                ("token expired", true),
+                ("login shell failed", false),
+                ("authentication service unavailable", false),
+                ("tool execution failed", false),
+                ("network timeout", false),
+            ] {
+                let mut parser = StreamParser::new(adapter_for("codex"));
+                let events = parser.line(&json!({"type":kind,"error":{"message":message}}).to_string());
+                assert!(
+                    matches!(events.as_slice(), [AgentEvent::Error { remediation, message: shown, .. }]
+                    if remediation.is_some() == needs_login && shown == &format!("Codex: {message}")),
+                    "{kind}: {message}: {events:?}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2229,6 +2616,58 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         }
     }
 
+    /// The desktop Harness uses a custom batch launcher rather than an npm shim. Exercise the
+    /// real conversation runner through such a launcher, with no installed agent or network.
+    #[cfg(windows)]
+    #[test]
+    fn dsh_cmd_receives_multiline_and_long_tasks_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("dsh.cmd");
+        let exe = std::env::current_exe().unwrap().display().to_string().replace('%', "%%");
+        let script = format!(
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n\
+             if \"%~1\"==\"--help\" (echo --profile& exit /b 0)\r\n\
+             if not \"%~5\"==\"\" exit /b 2\r\n\
+             echo %*> \"%~dp0argv\"\r\n\
+             set \"{STDIN_ECHO_ENV}=%~dp0stdin\"\r\n\
+             \"{exe}\" --exact --test-threads=1 cli_agents::tests::stdin_echo_child >nul\r\n\
+             if errorlevel 1 exit /b 1\r\n\
+             echo DSH_STDIN_FIXTURE_OK\r\n"
+        );
+        std::fs::write(&program, script).unwrap();
+        let cases = [
+            ("Instructions:\r\n", "-question?\r\n中文 %PATH% & ^ \"quoted\"\n\n".to_string()),
+            ("", "--not-a-flag\n".to_string()),
+            ("Instructions:\n", format!("{}\nlast line\n", "x".repeat(40_831))),
+        ];
+        for (preamble, prompt) in cases {
+            let _ = std::fs::remove_file(dir.path().join("stdin"));
+            let config =
+                BackendConfig { name: "DSH fixture".into(), kind: BackendKind::AgentCli, model: "dsh".into(), base_url: None, ssh_host: None, enabled: true };
+            let options = BackendOptions { command: Some(program.display().to_string()), timeout_secs: Some(20), ..Default::default() };
+            let mut spec = CliSpec::new(config, options, false, Some(dir.path().to_path_buf()));
+            spec.preamble = Some(preamble.into());
+            spec.builder = Some(Builder { investigation: None, inbox: dir.path().join("inbox") });
+            let mut c = CliConversation::new(spec);
+            c.send(&prompt);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut events = Vec::new();
+            while std::time::Instant::now() < deadline && !events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                events.extend(c.poll());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            c.stop();
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })), "{events:?}");
+            assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("DSH_STDIN_FIXTURE_OK"))), "{events:?}");
+            assert_eq!(std::fs::read(dir.path().join("stdin")).unwrap(), format!("{preamble}{prompt}").as_bytes());
+            let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+            assert!(argv.starts_with("--profile headless --patch "), "{argv}");
+            assert!(!argv.trim_end().ends_with(" -"), "old Harness versions would run a literal dash: {argv}");
+            assert!(!argv.contains(&prompt), "task text must not appear in argv");
+        }
+    }
+
     const STDIN_ECHO_ENV: &str = "CRAFT_ANYTHING_TEST_STDIN_ECHO";
 
     /// Not a test on its own: when run as the child of the test above, writes its stdin to the
@@ -2346,8 +2785,11 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
     /// Agents that are never handed the tool server build without the helper.
     #[test]
     fn only_agents_handed_the_tool_server_need_the_helper() {
-        for agent in ["gemini-cli", "aider", "no-such-agent"] {
-            assert!(check_builder_tools(adapter_for(agent).as_ref(), agent, &BackendOptions::default(), &CancelToken::default()).is_ok(), "{agent}");
+        // Aider is handed no tool server, so it needs no helper; it still needs a model or key
+        // before it runs (#72), which its own tests cover.
+        let aider = BackendOptions { cli_model: Some("anthropic/claude-sonnet-4".into()), ..Default::default() };
+        for (agent, options) in [("gemini-cli", BackendOptions::default()), ("aider", aider), ("no-such-agent", BackendOptions::default())] {
+            assert!(check_builder_tools(adapter_for(agent).as_ref(), agent, &options, Path::new("."), &CancelToken::default()).is_ok(), "{agent}");
         }
     }
 
@@ -2419,13 +2861,13 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         let mut p = StreamParser::new(echo);
         assert!(matches!(p.line(r#"{"say":"hello"}"#).as_slice(), [AgentEvent::TextDelta { text }] if text == "hello"));
         // Unknown agents stream their output as text; the built-ins keep their own adapters.
-        assert!(!reg.for_agent("aider").streams_json());
+        assert!(!reg.for_agent("no-such-agent").streams_json());
         assert!(reg.for_agent("claude").resumes() && !reg.for_agent("codex").resumes() && reg.for_agent("antigravity").resumes());
         // Registering an adapter for an existing id replaces that one.
         reg.register(Arc::new(EchoAgent));
         assert_eq!(
             format!("{reg:?}"),
-            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "copilot", "dsh", "echo-agent"]"#
+            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "copilot", "grok", "dsh", "devin", "echo-agent"]"#
         );
     }
 
@@ -2452,6 +2894,71 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         assert!(acp_for(&spec).is_none());
         spec.config.model = "copilot".into();
         assert!(acp_for(&spec).is_some());
+    }
+
+    /// A remote host runs whichever craft-anything-cli it has, of any release. Every release, from
+    /// 0.1.0 on, knows the global `--deep` and `--clean-room` and applies them in `mcp`, and has
+    /// `mcp --all-tools`, so a remote tool server gets only those (adapters add nothing else, Codex
+    /// only `--all-tools`). A flag outside them needs the remote CLI checked first, or an older one
+    /// stops the build at its first tool. Of our own variables the remote side gets only
+    /// `CRAFT_ANYTHING_AGENT`, which no release up to 0.5.0 reads (R2.8 keeps that open).
+    #[test]
+    fn a_remote_tool_server_gets_only_flags_every_release_knows() {
+        use craft_anything_engine::{TargetKind, target::TargetContext};
+        for deep in [false, true] {
+            for builder in [false, true] {
+                let config = BackendConfig {
+                    name: "Remote".into(),
+                    kind: BackendKind::AgentCli,
+                    model: "claude-code".into(),
+                    base_url: None,
+                    ssh_host: Some("build-box".into()),
+                    enabled: true,
+                };
+                let mut spec = CliSpec::new(config, BackendOptions::default(), false, Some(PathBuf::from("/p/investigation")));
+                spec.deep = deep;
+                spec.builder = builder.then(|| Builder { investigation: Some(PathBuf::from("/p/investigation")), inbox: PathBuf::from("/p/inbox") });
+                spec.targets = vec![TargetContext { path: PathBuf::from("/p/original.bin"), sha256: "0".repeat(64), kind: TargetKind::Elf, raw: None }];
+                let mcp = mcp_for(&spec, true);
+                assert_eq!(mcp.command, "craft-anything-cli", "the remote PATH's");
+                assert!(mcp.args.iter().all(|a| ["mcp", "--deep", "--clean-room", "--all-tools"].contains(&a.as_str())), "{deep} {builder}: {:?}", mcp.args);
+                assert!(mcp.args.contains(&if deep { "--deep" } else { "--clean-room" }.to_string()), "the run's mode, whatever the remote settings say");
+            }
+        }
+        for builder in [false, true] {
+            let ours: Vec<&str> = agent_env(builder, None).iter().map(|(name, _)| *name).filter(|name| name.starts_with("CRAFT_")).collect();
+            assert_eq!(ours, [craft_anything_engine::AGENT_ENV]);
+        }
+    }
+
+    /// A host without the helper is told apart from a failed connection: the fix is to install it
+    /// or put it on the PATH ssh sessions use.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_without_the_helper_is_told_to_install_it() {
+        let empty = tempfile::tempdir().unwrap();
+        let out = craft_anything_platform::Process::new("/bin/sh")
+            .args(["-c", adapters::REMOTE_CHECK_LINE])
+            .env_clear()
+            .env("PATH", empty.path())
+            .timeout(std::time::Duration::from_secs(5))
+            .run()
+            .unwrap();
+        assert_eq!(out.code, Some(127));
+        let err = adapters::remote_failure("build-box", &out);
+        assert!(err.message.contains("craft-anything-cli wasn't found on build-box"), "{}", err.message);
+        assert!(err.remediation.unwrap_or_default().contains("PATH"));
+    }
+
+    /// Claude Code and Codex hand a remote host's own craft-anything-cli the tool server, so a build
+    /// over SSH asks the host for it first, as one here checks this computer's.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_builder_checks_the_hosts_tool_server_first() {
+        for agent in ["claude-code", "codex"] {
+            let err = adapter_for(agent).check_remote_tool_server("no-such-host.invalid", &CancelToken::default()).expect_err(agent);
+            assert_eq!(err.code, ErrorCode::EngineMissing, "{agent}: {}", err.message);
+        }
     }
 
     #[test]

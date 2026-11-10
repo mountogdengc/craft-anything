@@ -7,6 +7,7 @@
 
 pub mod build_plan;
 pub mod clean_room;
+pub mod extensions;
 
 /// Tools an agent app may be told to approve on its own side (Codex's `approval_mode`): each one
 /// asks the person itself (`Effects::needs_consent`), so approving it there skips nothing.

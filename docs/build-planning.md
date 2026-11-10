@@ -1,6 +1,6 @@
 # Planned builds and completion
 
-A build has a durable product plan in its investigation. The builder, project screen and
+A build has a durable product plan in its planning extension. The builder, project screen and
 completion decision read the same record. Provider-specific todo lists remain readable in older
 projects, but they do not replace a saved build plan or prove that a requested feature works.
 
@@ -32,7 +32,7 @@ composer, where the person can add an answer or screenshots before sending it.
 
 ## Headless tools and persistence
 
-Call `core_investigation_show` to read `build_plan` and the investigation's `revision`. Save the
+Call `core_build_plan_show` to read `plan` and its independent planning `revision`. Save the
 whole revised plan with `core_build_plan_update`:
 
 ```json
@@ -65,21 +65,38 @@ whole revised plan with `core_build_plan_update`:
 ```
 
 Use the actual current revision, not the example's zero. A stale revision is refused; reload and
-merge the change before retrying. The existing cross-process investigation lock and atomic write
-path protect updates. Progress updates retain existing phase IDs and required input and acceptance
+merge the change before retrying. Cross-process locks and atomic writes protect updates. Planning updates do not advance the
+analysis revision; analysis updates do not advance the planning revision. Progress updates retain existing phase IDs and required input and acceptance
 IDs; a required criterion also retains its phase. These records cannot be removed or made optional
 to obtain a completed result. Optional records may be removed. An explicit required-scope revision
 workflow is follow-up work; the person can still accept a partial result with **It's done**.
 The canonical data lives in
-`investigation.cany/investigation/state.json`; `plan.md` is a readable rendering. State has a format
-version and a published [schema](schemas/investigation.schema.json). Legacy unversioned
-investigations load with defaults. Corrupt, oversized or unsupported state is refused rather than
+`investigation.cany/extensions/planning/state.json`; `extensions/planning/plan.md` is its readable
+rendering. State has its own version and [schema](schemas/planning.schema.json). Embedded legacy
+plans are read without rewriting their source. The first planning update or analysis save preserves
+them in the extension record. A present extension record is authoritative even when unreadable. Corrupt, oversized or unsupported state is refused rather than
 overwritten or treated as a completed plan.
 
 Verified criteria must cite observed/derived evidence or actual recorded check results. Check
 references identify the check, its recorded round, and optionally an exact claim. A later passing
 repeat of the same check and claim revalidates the citation; a missing or failing latest result
 does not. Fabricated evidence IDs and unsupported check citations are rejected.
+
+## Native extension boundary
+
+`crates/planning` owns the model, validation, completion policy and versioned store.
+`engine::extensions` registers its tools and projects compatibility views through generic hooks.
+`ai::rebuild::extensions::WorkflowExtension` contributes setup, builder instructions, refinement
+and required readiness assessments. The default registry always includes planning; additional
+required extensions can be registered without replacing it. A failed required assessment blocks
+automatic completion and stops automatic refinement. Optional plugin checks are separate.
+
+Reused upstream check results still pass through the current required extension assessments.
+Changing the quality target, picture threshold, comparison widths or page limit invalidates the
+check cache, so a result accepted under an older comparison policy cannot satisfy a stricter one.
+
+Plans created before a project is open transfer with their evidence when a shared project is
+created. Opening an existing project reads its own planning record instead.
 
 ## What completion means
 

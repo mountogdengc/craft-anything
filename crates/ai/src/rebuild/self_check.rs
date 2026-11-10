@@ -8,9 +8,21 @@ use super::*;
 /// The round a builder's own check is run as; real rounds start at 1.
 pub const SELF_CHECK_ROUND: u32 = 0;
 
+/// How long one of the builder's own checks may take. The build waits for it, so a check still
+/// going after this is stopped and reported. Longer than a build's own steps need.
+pub const SELF_CHECK_LIMIT: Duration = Duration::from_secs(30 * 60);
+
 /// Where `rebuild_check` asks a project's run for a check.
 pub fn asks_dir(project: &Path) -> PathBuf {
     project.join("checks").join("asks")
+}
+
+/// The mark a run leaves beside a check request it has taken, until it answers, so
+/// `rebuild_check` can tell a check that is still going from a request no run took. None for an
+/// id that isn't an inbox id (a request's file can carry any `id`): no mark outside the folder.
+pub fn taken_mark(project: &Path, id: &str) -> Option<PathBuf> {
+    let valid = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid.then(|| asks_dir(project).join(format!("{id}.taken")))
 }
 
 /// Projects whose build runs in this process. A builder in this process (an API backend) calls
@@ -143,8 +155,18 @@ impl Worker {
         let Some((kind, good_enough)) = self.self_check.clone() else { return Ok(()) };
         let asks = Inbox::new(asks_dir(&ws.root));
         for r in asks.pending() {
-            self.step(ws, Step::Build, Status::Building, "The builder is checking its work and available evidence…")?;
-            let (text, line) = match self.run_checks(ws, kind.as_ref(), SELF_CHECK_ROUND) {
+            let mark = taken_mark(&ws.root, &r.id);
+            if let Some(mark) = &mark
+                && let Err(e) = std::fs::write(mark, b"")
+            {
+                log::warn!("couldn't mark the builder's check as taken ({}): {e}", mark.display());
+            }
+            let checking = "The builder is checking its work and available evidence…";
+            self.step(ws, Step::Build, Status::Building, checking)?;
+            let checked = self.checks_unless_unchanged(ws, kind.as_ref(), SELF_CHECK_ROUND, || {
+                self.run_checks_within(ws, kind.as_ref(), SELF_CHECK_ROUND, Some(SELF_CHECK_LIMIT))
+            });
+            let (text, line) = match checked {
                 Ok(checks) => {
                     let line = format!("The builder checked its work: {}.", summary(&checks, good_enough));
                     match open_questions(ws) {
@@ -159,6 +181,9 @@ impl Worker {
                 Err(e) => (format!("The check couldn't run: {}", e.message), "The builder's check couldn't run.".to_string()),
             };
             asks.answer(&r.id, &Answer { text: Some(text), ..Default::default() })?;
+            if let Some(mark) = &mark {
+                let _ = std::fs::remove_file(mark);
+            }
             self.step(ws, Step::Build, Status::Building, &line)?;
         }
         Ok(())

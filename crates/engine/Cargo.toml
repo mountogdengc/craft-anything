@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 craft-anything-evidence = { workspace = true }
+craft-anything-planning = { workspace = true }
 craft-anything-formats = { workspace = true }
 craft-anything-disasm = { workspace = true }
 craft-anything-js = { workspace = true }

@@ -1,4 +1,4 @@
-//! `cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>`
+//! `cargo xtask <layers | locks | status | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>`
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ mod i18n_coverage;
 mod ico;
 mod locks;
 mod secrets;
+mod status;
 
 /// Workspace crates and their layer. A crate may depend only on strictly lower layers
 /// (L0 format crates depend on nothing in the workspace).
@@ -19,6 +20,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("craft-anything-analysis", 2),
     ("craft-anything-platform", 2),
     ("craft-anything-engines", 3),
+    ("craft-anything-planning", 3),
     ("craft-anything-engine", 4),
     ("craft-anything-ai", 5),
     ("craft-anything-mcp", 5),
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
     let ok = match args.first().map(String::as_str) {
         Some("layers") => layers(&root),
         Some("locks") => locks::check(&root),
+        Some("status") => status::check(&root),
         Some("i18n-coverage") => i18n_coverage::check(&root),
         Some("tools") => tools(&root, args.iter().any(|a| a == "--check")),
         Some("schemas") => schemas(&root, args.iter().any(|a| a == "--check")),
@@ -51,7 +54,8 @@ fn main() -> ExitCode {
             ico::run(&rest).map_err(|e| eprintln!("ico: {e}")).is_ok()
         }
         Some("ci") => {
-            layers(&root)
+            status::check(&root)
+                && layers(&root)
                 && locks::check(&root)
                 && i18n_coverage::check(&root)
                 && secrets::secrets(&root, false)
@@ -67,7 +71,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>"
+                "usage: cargo xtask <layers | locks | status | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>"
             );
             false
         }
@@ -355,6 +359,7 @@ fn schemas(root: &Path, check: bool) -> bool {
     let files = [
         ("craft.schema.json", craft_anything_engine::workspace::manifest_schema()),
         ("investigation.schema.json", craft_anything_engine::tools::investigation_tools::investigation_schema()),
+        ("planning.schema.json", craft_anything_engine::extensions::planning::schema()),
         ("build-progress.schema.json", craft_anything_engine::workspace::progress::build_progress_schema()),
         ("mechanics.schema.json", craft_anything_engine::mechanics::mechanics_schema()),
         ("self-test.schema.json", craft_anything_engine::self_test::self_test_schema()),

@@ -96,6 +96,10 @@ fn ensure_agent(hub: &AiHub, requested: Option<&str>) -> Result<(), ToolError> {
 fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
     let engine = make_engine(None, cli.deep_for_run())?;
     let hub = AiHub::new(engine.clone());
+    // Before the build starts, while no session lock is held (#1225).
+    if let Err(e) = hub.ensure_session_id() {
+        log::warn!("couldn't save the OpenCode Go session id: {e}");
+    }
     if a.build_with.is_some() && a.continue_in.is_some() {
         return Err(ToolError::invalid("--build-with is for new projects; a project keeps the stack it was built with.")
             .with_remediation("Leave out --build-with, or start a new project."));
@@ -130,6 +134,9 @@ fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
         }
     };
     println!("Project: {}", ws.root.display());
+    // The saved builder may be off or gone; say who builds once the run has started, so a failed
+    // start doesn't claim an AI that never ran.
+    let replacement = rebuild::builder_replacement(&hub.config(), &ws, a.backend.as_deref());
     // A follow-up shows in the project's feed as the person typed it.
     let shown = message.clone();
     let good_enough = engine.session().settings.build.good_enough;
@@ -141,9 +148,13 @@ fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
         max_rounds: a.rounds,
         good_enough,
         beginner: !cli.json,
+        clean_room: Some(engine.session().clean_room()),
         ..RunOptions::default()
     };
     let mut run = RebuildRun::start(&hub, ws, opts)?;
+    if let Some(replacement) = replacement {
+        eprintln!("{}", rebuild::replaced_builder_notice(&replacement.saved, &replacement.used));
+    }
     let mut ok = false;
     let mut line_open = false;
     loop {

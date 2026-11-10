@@ -39,14 +39,14 @@ read-only; `store::update(root, expected, plan, cancelled, validate)` validates 
 atomically saves; `store::preserve_before_legacy_write(root, cancelled)` assumes the host's legacy
 lock is already held and acquires only the extension lock. New core code must not depend on engine.
 
-- [ ] Add engine-level regression cases for sidecar writes and legacy preservation, observe RED:
+- [x] Add engine-level regression cases for sidecar writes and legacy preservation, observe RED:
       legacy revision 7 and required criterion IDs survive first extension update; legacy bytes
       remain unchanged by import; corrupt/future sidecar blocks read/update instead of fallback.
-- [ ] Move existing policy into the L3 crate; adapt recorded-check validation through the trait.
-- [ ] Implement bounded read, checked revision increments, locking, legacy import and atomic save.
-- [ ] Preserve scope/evidence validation and add direct storage cases for stale updates, racing
+- [x] Move existing policy into the L3 crate; adapt recorded-check validation through the trait.
+- [x] Implement bounded read, checked revision increments, locking, legacy import and atomic save.
+- [x] Preserve scope/evidence validation and add direct storage cases for stale updates, racing
       writers, unavailable lock/cancellation and legacy overwrite prevention.
-- [ ] Run the planning crate tests and focused adapter migration tests; commit the tested extraction.
+- [x] Run the planning crate tests and focused adapter migration tests; commit the tested extraction.
 
 ### Task 2: Move tools, workflow policy and UI reads to extension adapters
 
@@ -59,16 +59,20 @@ issue; `core_build_plan_update` retains its input shape and scope/evidence enfor
 Required workflow hooks supply preparation instructions, prompt contributions and completion/
 refinement assessments. Their errors remain errors/blockers; absence of a saved plan requests
 setup before implementation. The host loop knows generic extension assessment, not plan fields.
+The adapter also owns a session-scoped `State` slot. A generic new-project hook transfers it
+without replacing existing canonical or legacy planning data.
 
-- [ ] Add focused hook regressions, observe RED: required-hook failure and missing/corrupt state
-      cannot produce Ready; a failing optional check cannot replace the required assessment.
-- [ ] Move ToolSpecs, planning queries, evidence checks and renders into the engine adapter.
+- [x] Add focused hook regressions, observe RED: required-hook failure and missing/corrupt state
+      cannot produce Ready; passing built-in checks cannot mask a failed required assessment.
+- [x] Move ToolSpecs, planning queries, evidence checks and renders into the engine adapter.
       Route analysis persistence through the generic legacy-preservation hook; update clients to
       use the dedicated planning revision. Preserve the old model import/tool ID where practical.
-- [ ] Move preparation, planning prompts, refinement and completion policy into the AI extension;
+- [x] Move preparation, planning prompts, refinement and completion policy into the AI extension;
       retain only generic hook calls and generic incomplete-result handling in the host loop.
-- [ ] Switch UI facts and tests to the extension query; preserve supplied-input composer behavior.
-- [ ] Run planning, readiness, review-regression and UI planning cases plus affected headless tool
+- [x] Switch UI facts and tests to the extension query; preserve supplied-input composer behavior.
+- [x] Verify pre-project planning revisions, new-project transfer with usable evidence, and that
+      opening another existing project cannot import unrelated scratch planning state.
+- [x] Run planning, readiness, review-regression and UI planning cases plus affected headless tool
       registration checks. Regenerate changed tool/schema docs; commit the tested adapter extraction.
 
 ### Task 3: Integrate newer upstream without losing extension authority
@@ -79,23 +83,26 @@ extension integration with session modes, check reuse/deadlines and vision-aware
 **Interfaces:** preserve upstream history in a two-parent integration commit. The required
 extension still assesses completion after the current checks, including reused valid results.
 
-- [ ] Pin the fetched upstream SHA and review the delta beyond the previously audited snapshot.
-- [ ] Merge into this feature branch, resolve shared code by retaining upstream mechanisms and
+- [x] Pin `e09888e14641d71eca7951ac6248fa207b16881a`; its one-commit delta from the audited
+      snapshot concerns OpenCode unfinished-session cleanup, app startup and documentation.
+- [x] Merge into this feature branch, resolve shared code by retaining upstream mechanisms and
       calling the generic extension hooks. Do not omit whole commits merely for text overlap.
-- [ ] Add migration regressions for fork/upstream v4 records and required-hook/cached-check
+- [x] Add migration regressions for fork/upstream v4 records and required-hook/cached-check
       integration; observe failures before the corresponding fixes.
-- [ ] Run focused migration, planning, readiness, self-check and changed lifecycle regressions.
+      Unlabelled legacy sessions start fresh in Clean room, preserving files and plans; explicitly
+      Clean room sessions retain their recorded mode and permitted resume behavior.
+- [x] Run focused migration, planning, readiness, self-check and changed lifecycle regressions.
       Check affected CLI/MCP/desktop compilation; explain any broader validation that is needed.
-- [ ] Commit the tested integration with upstream authorship/history retained.
+- [x] Commit the tested integration with upstream authorship/history retained.
 
 ### Task 4: Review, verify and publish
 
-- [ ] Run scoped strict Clippy for planning/engine/AI/UI and affected entry-point compilation;
+- [x] Run scoped strict Clippy for planning/engine/AI/UI and affected entry-point compilation;
       formatting, layers, locks, staged secrets, relevant generated schema/tool checks and the
       shared WASM check for integrated L0-L2 changes. No full workspace suite by default.
-- [ ] Request one fresh whole-branch review. Resolve Important/Critical findings in one regression
+- [x] Request one fresh whole-branch review. Resolve Important/Critical findings in one regression
       fix pass, with focused RED/GREEN evidence; record any deferred minor findings.
-- [ ] Update roadmap, STATUS, extension/migration documentation and the local devlog with exact
+- [x] Update roadmap, STATUS, extension/migration documentation and the local devlog with exact
       tested/not-tested scope. Report reduction in shared-file planning coupling.
 - [ ] Push the named branch and open its PR into fork main, referencing the older PR as superseded
       only after the new PR exists. Leave main unmerged and retain the worktree for review.

@@ -22,19 +22,19 @@ fn missing_comparison_retains_the_preview_and_cannot_bypass_the_plan() {
     let preview = serve_dir(&ws.app_dir()).unwrap();
     let url = preview.url();
     *worker.preview.lock().unwrap() = Some(preview);
-    let summary = worker.finish_checks(&mut ws, 1, 90.0).unwrap();
+    let summary = worker.finish_checks(&mut ws, 1, 90.0, &extensions::Extensions::default()).unwrap();
     assert_eq!(ws.manifest.status, Status::Incomplete);
     assert!(summary.contains("original") && summary.contains("compar"), "{summary}");
     assert_eq!(worker.preview.lock().unwrap().as_ref().map(StaticServer::url), Some(url));
 
     ws.manifest.checks = vec![CheckResult::new("app-screenshot", 2, true, "The original was compared.")];
-    worker.finish_checks(&mut ws, 2, 90.0).unwrap();
+    worker.finish_checks(&mut ws, 2, 90.0, &extensions::Extensions::default()).unwrap();
     assert_eq!(ws.manifest.status, Status::Ready, "a complete plan and a repaired comparison may finish");
-    let state = ws.investigation_dir().join("investigation/state.json");
+    let state = ws.investigation_dir().join("extensions/planning/state.json");
     let mut investigation: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
-    investigation["build_plan"]["phases"][0]["status"] = json!("todo");
+    investigation["plan"]["phases"][0]["status"] = json!("todo");
     std::fs::write(&state, serde_json::to_vec_pretty(&investigation).unwrap()).unwrap();
-    worker.finish_checks(&mut ws, 2, 90.0).unwrap();
+    worker.finish_checks(&mut ws, 2, 90.0, &extensions::Extensions::default()).unwrap();
     assert_eq!(ws.manifest.status, Status::Incomplete, "a good comparison cannot finish an unfinished phase");
 }
 
@@ -48,7 +48,7 @@ fn essential_unknowns_block_final_readiness_and_the_builders_pass_message() {
     project.store_unknown(&question).unwrap();
     ws.manifest.checks = vec![CheckResult::new("app-screenshot", 1, true, "The window was compared.")];
     let mut worker = check_worker(&ws, false);
-    worker.finish_checks(&mut ws, 1, 90.0).unwrap();
+    worker.finish_checks(&mut ws, 1, 90.0, &extensions::Extensions::default()).unwrap();
     assert_eq!(ws.manifest.status, Status::Incomplete);
     assert!(ws.manifest.note.contains("save and reopen"));
     assert!(!self_check::report(&ws.manifest.checks, 90.0, &self_check::open_questions(&ws).unwrap()).contains("This would pass"));
@@ -120,7 +120,7 @@ pub(super) fn run_with(
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(UncomparedKind));
     let opts = RunOptions { message: Some("Continue this build".into()), max_rounds: 5, kinds, ..RunOptions::default() };
-    let result = worker.run(ws, entry, Some(api), None, &opts);
+    let result = worker.run(ws, entry, Some(api), None, KeptHistory::default(), &opts);
     let requests = seen.lock().unwrap().clone();
     (result, requests)
 }
@@ -147,4 +147,39 @@ fn a_legacy_native_study_without_observation_stops_before_a_builder_turn() {
     let (result, requests) = run_once(&mut ws);
     assert!(result.is_err(), "missing native observation must be surfaced before implementation");
     assert!(requests.is_empty(), "no provider call is needed to identify missing local evidence");
+}
+
+#[test]
+fn an_incomplete_run_is_not_reported_as_success_by_the_upstream_outcome_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Incomplete outcome", "Keep unfinished work", TargetRef::None).unwrap();
+    ws.set_status(Status::Incomplete, "Verification remains open.").unwrap();
+    let (ok, message, paused) = super::super::run_outcome(Ok(Ok("Verification remains open.".into())), &mut ws);
+    assert!(!ok, "an Ok return can describe an incomplete run");
+    assert!(!paused);
+    assert_eq!(message, "Verification remains open.");
+    assert_eq!(Workspace::open(&ws.root).unwrap().manifest.status, Status::Incomplete);
+}
+
+#[test]
+fn recovered_native_observation_prompts_respect_the_builders_picture_capability() {
+    let blind = super::super::brief::local_observation_reminder(false);
+    assert!(!blind.contains("Open capture/window.png"), "a blind builder cannot open a recovered picture: {blind}");
+    assert!(blind.contains("capture/ui-tree.json"));
+    assert!(super::super::brief::local_observation_reminder(true).contains("Open capture/window.png"));
+}
+
+#[test]
+fn a_round_deadline_is_reported_as_timeout_rather_than_a_persons_pause() {
+    let deadline = CheckStop::limited(Instant::now());
+    assert_eq!(deadline.check().unwrap_err().code, ErrorCode::TimedOut);
+    assert!(deadline.cancelled());
+    assert!(!deadline.paused());
+    assert_eq!(deadline.time_left(), Some(Duration::ZERO));
+    let person = CancelToken::default();
+    person.cancel();
+    let pause = CheckStop::from(&person);
+    assert_eq!(pause.check().unwrap_err().code, ErrorCode::Cancelled);
+    assert!(pause.paused());
+    assert!(!pause.expired());
 }

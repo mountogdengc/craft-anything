@@ -252,6 +252,27 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     h.get_by_label("Build without it");
 }
 
+/// A game's chosen folder is shown like every chosen folder: cut to fit its row, never widening the
+/// page, with the whole path on hover.
+#[test]
+fn a_long_game_folder_stays_inside_the_window() {
+    let folder = format!("D:/Games/{}/Cave Game", "A folder with a very long name ".repeat(12).trim());
+    let path = std::path::PathBuf::from(&folder);
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::deep(&mut a);
+        a.state.screen = Screen::GameFiles;
+        a.state.game.folder = Some(path);
+        a
+    });
+    h.run_steps(4);
+    let width = h.ctx.content_rect().width();
+    let shown = craft_anything_ui_egui::short_path(std::path::Path::new(&folder));
+    let r = h.get_by_label(&shown).rect();
+    assert!(r.right() <= width, "the folder ({r:?}) stays inside the {width}px window");
+    assert!(r.height() < 30.0, "it's cut to one line, not wrapped ({r:?})");
+}
+
 #[test]
 fn a_long_prompt_wraps_inside_the_window_in_the_project_and_the_chat() {
     use craft_anything_ui_egui::state::{ChatItem, FeedItem, UserItem};
@@ -831,9 +852,10 @@ fn an_approval_that_cant_be_saved_isnt_shown_as_chosen() {
     });
     h.run_steps(2);
     // A newer Craft Anything saved it meanwhile: this one only reads it, so the choice is refused.
-    let mut newer: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    newer["version"] = serde_json::json!(99);
-    std::fs::write(&file, serde_json::to_vec_pretty(&newer).unwrap()).unwrap();
+    let current = craft_anything_engine::workspace::MANIFEST_VERSION;
+    let newer = std::fs::read_to_string(&file).unwrap().replacen(&format!("\"version\": {current}"), &format!("\"version\": {}", current + 1), 1);
+    assert!(newer.contains(&format!("\"version\": {}", current + 1)));
+    std::fs::write(&file, newer).unwrap();
     h.state_mut().state.project_input = "/approvals push allow".into();
     h.run_steps(1);
     h.get_by_label("Send (Enter)").click();
@@ -2110,6 +2132,30 @@ fn a_projects_saved_time_and_ai_use_show_beside_it_and_the_session_total_in_the_
 }
 
 #[test]
+fn a_big_cost_doesnt_paint_over_its_caption() {
+    use craft_anything_engine::workspace::ProjectUsage;
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().to_path_buf();
+    ProjectUsage::update(&root, |u| {
+        u.work_ms = 725_000;
+        u.add_turn(1_180_000, 42_000, Some(13_021.36), true);
+    })
+    .unwrap();
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_project(&mut a);
+        if let Some(ws) = a.workspace.as_mut() {
+            ws.root = root.clone();
+        }
+        a
+    });
+    h.run_steps(3);
+    let caption = h.get_by_label("AI cost (estimate)").rect();
+    let value = h.get_by_label("about $13021.36").rect();
+    assert!(!caption.intersects(value), "{caption:?} and {value:?}");
+}
+
+#[test]
 fn ghidras_memory_is_automatic_until_the_person_sets_it() {
     let mut h = harness_sized(egui::vec2(1280.0, 1000.0), || {
         let mut a = demo::app(demo::engine(Mode::Beginner, true));
@@ -2641,6 +2687,59 @@ fn make_says_who_builds_and_a_picked_builder_stays_with_the_project() {
 }
 
 #[test]
+fn a_turned_off_make_choice_says_who_builds_instead() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.backends.push(BackendConfig {
+            name: "Off".into(),
+            kind: BackendKind::Anthropic,
+            model: "test-model".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: false,
+        });
+        a.state.make.ai = Some("Off".into());
+        a
+    });
+    h.run_steps(3);
+    // The stale draft goes back to Automatic, and the toast says who builds instead.
+    assert!(h.state().state.make.ai.is_none());
+    assert_eq!(h.get_all_by_label("Built by").last().unwrap().value().as_deref(), Some("Automatic (Claude)"));
+    assert!(h.state().state.toasts.iter().any(|(t, err)| !*err && t.contains("Off") && t.contains("Claude")), "{:?}", h.state().state.toasts);
+}
+
+#[test]
+fn a_turned_off_or_removed_saved_builder_says_who_builds_instead() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.backends.push(BackendConfig {
+            name: "Off".into(),
+            kind: BackendKind::Anthropic,
+            model: "test-model".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: false,
+        });
+        a
+    });
+    h.run_steps(2);
+
+    // A turned-off saved builder: the default builds, and the person is told which one.
+    assert_eq!(h.state_mut().builder_backend(Some("Off")).as_deref(), Some("Claude"));
+    assert!(h.state().state.toasts.iter().any(|(t, err)| !*err && t.contains("Off") && t.contains("Claude")), "{:?}", h.state().state.toasts);
+
+    // A removed one too.
+    assert_eq!(h.state_mut().builder_backend(Some("Gone")).as_deref(), Some("Claude"));
+    assert!(h.state().state.toasts.iter().any(|(t, err)| !*err && t.contains("Gone") && t.contains("Claude")), "{:?}", h.state().state.toasts);
+
+    // An enabled choice, and Automatic, say nothing.
+    let quiet = h.state().state.toasts.len();
+    assert_eq!(h.state_mut().builder_backend(Some("Claude")).as_deref(), Some("Claude"));
+    assert_eq!(h.state_mut().builder_backend(None).as_deref(), Some("Claude"));
+    assert_eq!(h.state().state.toasts.len(), quiet, "no replacement notice when nothing was replaced");
+}
+
+#[test]
 fn with_nothing_to_build_with_start_offers_what_was_found_instead_of_a_dead_end() {
     use craft_anything_ui_egui::state::Modal;
     let mut h = harness(|| {
@@ -2713,6 +2812,43 @@ fn only_the_claude_desktop_app_is_named_when_nothing_can_build() {
     h.state_mut().detected = Some(vec![remote("Claude Code on box"), local]);
     h.run_steps(2);
     assert!(h.query_by_label("The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.").is_none());
+}
+
+/// A long reason on a card for an AI found on this computer wraps beside its Add button; it used
+/// to stay on one line and run on under the button.
+#[test]
+fn a_found_ais_long_reason_wraps_beside_its_add_button() {
+    use craft_anything_ai::Detected;
+    let reason = "Found the claude command on this computer, in a folder that another account's settings also point at, so adding it here uses the same sign-in as that one.";
+    let found = Detected {
+        suggestion: BackendConfig {
+            name: "Claude Code".into(),
+            kind: BackendKind::AgentCli,
+            model: "claude-code".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        },
+        reason: reason.into(),
+        needs_key: false,
+    };
+    let mut h = harness_sized(egui::vec2(900.0, 1000.0), move || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        a.backends.clear();
+        a.detected = Some(vec![found]);
+        // The fixture is the discovery result; keep host detection out of this UI test.
+        a.detecting = true;
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        a
+    });
+    h.run_steps(4);
+    let text = h.get_by_label(reason).rect();
+    // The card's Add is the one on the reason's lines (the address form below has one too).
+    let add = h.query_all_by_label("Add").map(|n| n.rect()).find(|r| r.top() < text.bottom() && r.bottom() > text.top() - 30.0);
+    let add = add.expect("the card has an Add button beside its text");
+    assert!(text.right() <= add.left(), "the reason ({text:?}) ends before the Add button ({add:?})");
+    assert!(text.height() > 20.0, "the reason wraps onto more than one line ({text:?})");
 }
 
 #[test]

@@ -9,7 +9,7 @@ Keep entries short: what happened, then the rule.
 **Two branches used the same format number for different contracts.** The fork's incomplete
 status and upstream's approval choices independently used `craft.json` version 3. The combined
 format is version 4, so an older build cannot silently save away permissions. Test both historical
-variants through open, save and copy, and keep future-version write refusal covered.
+variants through open, save and copy, and keep future-version write refusal covered. The later upstream session-mode format also used 4; the combined format is 5. Preserve explicit modes and treat an unlabelled saved session conservatively as Deep. Assert current saves against `MANIFEST_VERSION`, not a copied numeric literal; keep numeric versions only in historical fixtures.
 
 **A shared Cargo target reused another worktree's old platform library.** Restored source files
 had older timestamps than the cached build, so the new engine linked against an older API. Use a
@@ -79,6 +79,12 @@ added an app the new rule rejected; both were green on their own branch.
   And with a layout change: #687 moved coding agents onto their own tab of what Detect found, and
   #664, merged next, tested a button on that list without picking the tab. Checking that two PRs
   merge cleanly isn't checking that their tests pass together: run the UI tests on the merge.
+
+**A table row kept twice by a merge.** Two PRs edited the same STATUS.md row; resolving the
+conflict kept both versions, so five rows reached `main` twice, each copy with a different
+update, and the three OpenCode rows disagreed on whether SSH runs get the tools. When a
+conflict is in a table row, merge the edits into one row, and after merging look for a row
+name that appears twice.
 
 **A dependency change merged without its lockfile.** Changes were staged with
 `git add -A crates apps docs`, which leaves out the root `Cargo.lock`, so a new dependency reached
@@ -173,12 +179,23 @@ and releasing a shared ephemeral port.
 same temp directory, and game detection walked up and found the game. Give each case its own
 `tempfile::tempdir()`.
 
+**Tests that share a process-wide value.** The start guard keeps its mark's lock in a `static`;
+one test's `opened()` emptied it while another test was between `begin` and its check, so
+`main` failed now and then although the PR's own run had passed. Tests that touch the same
+`static` take a shared test lock, even when each uses its own temp folder.
+
 **A mock server closed on a partial request.** A loopback fixture read a request only once, then
 replied and closed. TCP can split even a short header; unread bytes made that close reset the
 connection. Consume the complete header before replying, with a size cap and an absolute deadline.
 Negative probes use loopback port zero so another fixture cannot acquire a released port.
 A controlled fragmented request reproduced the fixture defect; the old CI log did not preserve
 the probe's underlying error, so it does not establish that failure's cause.
+
+**A socket option set after the peer reset it.** A preview test set its clients' read timeout
+after stopping the server. macOS answers `setsockopt` with `Invalid argument` on a socket closed in
+both directions (a reset, or the peer's FIN after our own `shutdown(Write)`); Linux doesn't check,
+so the test failed only on Macs. Set socket options right after connecting, before anything can
+close the connection.
 
 **A script written and run at once.** Tests that write a stand-in program and start it failed now
 and then on Linux with "Text file busy": another test thread was starting a child at that moment,
@@ -189,6 +206,11 @@ instead.
 **Proving a refactor changed nothing.** Unit tests that check substrings can miss changed prompts.
 For a refactor that must keep output identical, dump the outputs for every combination before and
 after and compare them byte for byte (done for every brief across 162 combinations in R1.1).
+
+**A guard phrase that matched the wording it protects.** A test that no blind builder is told to
+"look at the picture" failed on the new "you can't look at the pictures in reference/". Make a
+forbidden phrase the instruction's exact words, check each one still appears in what the other
+case is sent (or the guard goes stale without failing), and break the code once to see it fail.
 
 **A Windows-only test that no check ran.** #748 added a second Antigravity folder to the search
 path; the Windows test that counts those folders wasn't updated, and `main` stayed green because CI
@@ -216,6 +238,12 @@ project placement, the selected virtualenv interpreter and artifact paths stayed
 PATH lookup can return a relative path too. Resolve workspace paths against the process's
 current directory, look up only bare program names, and make the result absolute without
 dereferencing the virtualenv symlink. Test the generated capture request without opening a GUI.
+
+**A screenshot helper aborted inside CoreGraphics.** The first macOS screenshot probe used
+ScreenCaptureKit from a command-line Swift helper without initializing AppKit's WindowServer
+connection. An owned-window capture aborted in `CGS_REQUIRE_INIT`, while no-window regressions
+passed. Initialize `NSApplication.shared` on the main actor before capture, and verify an actual
+owned-window PNG as well as missing-window errors.
 
 **A model catalogue queried in the wrong project.** OpenCode V2's raw `api get /api/model` does
 not reliably select the invoking CLI's directory. Use the `model.list` operation with an explicit
@@ -326,6 +354,20 @@ code that never compiled (#399). A failed build command is an `Ok` tool result (
 so counting tool errors misses it. Cap a loop on what it is stuck on (build commands failing in a
 row, read from the typed `succeeded` field), not only on its total steps.
 
+**A context overflow that looked like a broken request.** Ollama fits a prompt that is too long
+for its context by dropping the oldest messages, keeping the system prompt; the person's request
+went first, and a Qwen 3.8 model refused the rest with 500 "no user query found in messages"
+(#1245). It read as a fault in our request, and as a server error it was retried three times. The
+error came from Ollama's source (`server/prompt.go`, `model/renderers/qwen35.go`), not from the
+words: when a local server's error makes no sense for the request sent, read what the server does
+to it first, and mark a refusal that can't change on retry with a typed field (`context_overflow`).
+
+**A limit left unset is the largest one.** We sent OpenRouter no `max_tokens`, so it held the
+model's whole output limit (131,072 tokens for Kimi K3.1 Pro) against the key's credit, and a key
+with $35 left of its daily limit was refused with 402 before the model ran (#1213). When a service
+bills or reserves by a request's limits, find out what it assumes when one is missing; when it says
+what it can afford, ask again within that.
+
 **A router that picks the provider for you.** OpenRouter sends each request to one of several
 upstream providers, and a provider without tool calling answered 400 "Provider returned error"
 (#369), which said nothing the person could act on. For a service that routes, say in the request
@@ -399,6 +441,10 @@ And when the shim's Node couldn't be found (nvm for Windows with no version in u
 `C:\Program Files\nodejs` link was gone), we fell back to the `.cmd`, and Rust refused the
 multi-line prompt: "batch file arguments are invalid", which named neither Node nor nvm. Search
 nvm's version folders too, and when a shim's interpreter is missing, say so (`interpreter_missing`).
+The desktop DeepSeek Harness has a custom batch launcher, so npm-shim handling does not unwrap
+it either. Send its task on stdin, with no task argument. A literal `-` is a stdin marker in newer
+Harness versions but is the task itself in older ones; omitting the task makes those older versions
+fail before a model runs. They need an update to a headless profile that supports stdin.
 
 **A first analysis that waited for a lock it could never take.** Ghidra's analysis lock is created
 with `create_new` in `ghidra-cache/`, which only existed on machines that had used it before; on a
@@ -458,6 +504,17 @@ but judged it against the UI's workspace snapshot from before the run. A failed 
 look verified until the run ended. Read the latest saved check history on the same background
 worker before preparing the plan view; test both a failing and a passing repeat while the UI's
 snapshot stays unchanged.
+
+**A round of checks that nothing could stop.** The builder's own checks ran one after another on
+the build's thread with no time limit, Pause was looked at only between tool calls, and the feed
+said only "checking its work against the original" for the whole round, so a check that stalled
+named no check and could hold the build for hours. Give a builder's checks a round time limit,
+look at Pause before each check, and say each check as its own step. The limit must reach the
+checks' own program runs too: a build step (a game engine's import, a cold compile) makes no tool
+call, so a limit that only applies "at the next tool call" leaves exactly the step that hangs.
+A check that's cut off is a failed check with its reason, never a silent wait. And every way a
+run can end — including a caught bug — records the project's status: leaving the last status on
+disk ("Checking" while nothing runs) reads as a stuck build that can't be retried.
 
 **An early error without a terminal event.** Model validation returned after reporting an error,
 but headless chat waits for `TurnDone`, not just an idle worker. Preflight failures and cancellation
@@ -543,6 +600,13 @@ V2 also names a tool call `id` (V1: `callID`), so every tool event was dropped a
 for the whole turn. Use a file in `OPENCODE_CONFIG` with `run --standalone`, and confirm a live run
 reached the server (`mcp connected server=craft-anything` in OpenCode's log), not just that it started.
 
+**A side door to a service the main path avoided.** Runs used `--standalone` so OpenCode's shared
+service never saw them, and #1185 deleted the sessions a stopped turn left. But the model check
+before each turn ran plain `api model.list`, which starts that service, and the service resumed a
+session the person had left unfinished days before and went on editing another project for half
+an hour. When a program has a mode that must be avoided, give every call to it the same flag, not
+only the main one: list each command we run (`run`, `api`, `session delete`) and test each.
+
 **Keywords that only some code paths honour.** "…in Rust" picked Rust for apps but not for games, so
 a headless game rebuild stopped at once for want of Unity. It was found only by a live run. Run the
 real flow end to end after changing how requests are read, and add the case as a test.
@@ -595,6 +659,9 @@ test a tool through `Engine::call` with a time limit on a thread.
 **A forked session's cost is the session's.** Claude Code's `total_cost_usd` for a
 `--fork-session` run is the whole session's running total ($22.67 for a question that cost cents).
 Don't show a cost you can't attribute to the thing it's shown beside.
+The same holds for `--resume`: a build turn's total is the session's running total, so summing
+each turn's total counted the session again every turn (#1187). Keep each session's last total and
+add only the increase; a per-turn `usage` block is per turn, the cost fields are not.
 
 **An option that offered nothing new.** Asked for "a shallow live copy", the pin dialog got a
 Live choice that copied nothing and opened the project's app, which is exactly Play, under a
@@ -640,6 +707,11 @@ on Windows (`write_atomic`); show errors where the person is looking.
 `env` values included, which can hold API keys; a tool's output reaches the journal and MCP
 clients. The journal only redacts by field name. When a setting can hold a secret, hide its value
 in every tool that prints settings, and test that it doesn't appear.
+
+**A secret check that matched a word inside a name.** `cargo xtask secrets` took any variable
+with `AUTH` in its name as a secret; git sets `GIT_AUTHOR_NAME` while the hook runs, so a contributor
+whose git name is their handle couldn't commit their own roadmap claim. Name the exceptions
+(`NOT_SECRET`) rather than loosening the word, and test both sides with a list of variables.
 
 **Secret files kept out only by one person's gitignore.** `.env` files and
 `.claude/settings.local.json` were ignored by a contributor's global gitignore, not the repo's, so
@@ -698,6 +770,14 @@ builder loop saved the reset only after a successful turn. A failed or cancelled
 removed the note, so reopening kept the old unchanged-turn count. Persist deferred request state
 on terminal errors too, outside provider retries; keep the original outcome if that save also fails.
 
+**Context added to the message but not the note.** "Just ask" answers were prepended to the
+builder's next message, but a note can reach a builder through its tool hook before any message,
+so the note carried the request without what it referred to. Put shared context where every path
+reads it (the note's hand-over file and the after-turn prompt), not in one delivery path, and test
+the fast path (hook) and the fallback (after the turn) separately. Mark it told only when the note
+is actually read or sent, never when it is written; and keep a note's raw text so a later run can
+filter answers by its own mode.
+
 **Lower-casing a command, then comparing its paths.** Auto mode lower-cased a shell command to
 match keywords, then checked its paths against the project folder with that same text; Windows
 compares paths without case, so only a Mac showed it: deleting `/Users/…/app/Build` in the
@@ -750,6 +830,12 @@ the install then downloaded the same release again (#740). Install folders are a
 list: scan the folders people keep such things in (`KnownRoot`, by folder name, a set number of
 levels down), and make an install use a copy already found outside our store. Test each layout
 (unzipped, cask, capitalised name) with temp folders, not the machine the test runs on.
+
+**A per-run id that a provider expects to be stable.** OpenCode Go refuses a request without
+`x-opencode-session` (#1225). The header was sent, but only for backends saved with an id, so
+backends from older versions or found from a key got a new id on every run. A fallback id for one
+run is a workaround, not a fix: give each saved provider backend its id once, at startup, before
+any session lock is held (`AiHub::ensure_session_id`), and test a restart keeps the same id.
 
 ## Agent tooling
 
@@ -815,6 +901,11 @@ for two minutes and the edit after it never ran. Make an edit with the editor to
 line. The same session typed it once more, with `</dev/null` added, and that hung too: the habit
 is the problem, not the input. Every Python step names a script file.
 
+**A shell script tried in bash, run by dash.** A watcher script written for `/bin/sh` used
+`kill -0 -- -<group>` and passed in Git Bash; on Ubuntu `/bin/sh` is dash, whose `kill` takes `--`
+as a process id, so the script quit at once and both of its tests failed in CI. Try a `/bin/sh`
+script with `dash` (or `checkbashisms`) as well as bash, and keep to what both accept.
+
 **A search that ran no search.** `timeout 40 find … 2>/dev/null` on a Mac: there's no `timeout` there,
 the error went to `/dev/null`, and the empty result read as "no such files on this computer". Don't
 hide a command's errors when an empty result means something; set the time limit on the tool call.
@@ -865,6 +956,14 @@ least that long, and reject an earlier matching close followed by more text. Sho
 lines inside a longer fence are content. Test both paths and the next HTTP request, including
 malformed suffixes and non-call JSON examples whose strings contain protocol markers.
 
+**A call the server couldn't read, taken for the answer.** A llama.cpp server turns a Qwen
+model's `<tool_call><function=…>` markup into a real call only when it names an offered tool;
+otherwise it hands the markup back as text. The loop read text with no call as the final
+answer, so a 512k-window build that called `web_search` stopped its turn after 3 minutes and
+failed its check. Text recovery that only knows the formats seen so far ends a turn silently on
+the next one: read a model's own call format, and when it names a tool it doesn't have, tell it
+so and name the ones it has, rather than ending.
+
 **A view that asked to be scrolled on every frame.** The command palette called `scroll_to_me` on
 the selected row each frame, so the wheel's scroll was pulled back to it at once and the list
 kept jumping to the top (#584). Scroll something into view on the frame it changed (a key, a new
@@ -901,3 +1000,9 @@ different branches reused the same package output path and one saw the other bra
 Give every worktree its own `CARGO_TARGET_DIR`, even when one agent manages both. Cleaning
 the shared engine cache then removed 11.6 GiB of compiled artifacts: avoid shared-cache
 cleanup as a recovery shortcut; use an isolated target directory for further verification.
+
+**A partial archive listing counted as a complete install.** A GNU-name limit correctly stopped
+an archive parser, but the installer wrote earlier listed files and returned success. Preserve the
+partial inventory for inspection, expose the stop as typed data, and make extraction check it before
+writing any member. Missing end markers need their own compatibility control; `complete: false`
+alone does not identify a refused metadata record.

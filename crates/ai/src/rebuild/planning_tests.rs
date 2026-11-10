@@ -13,12 +13,16 @@ impl Check for SavedDraftCheck {
         "saved-draft"
     }
     fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
-        let saved = std::fs::read_to_string(cx.ws.app_dir().join("draft.txt")).ok().as_deref() == Some("unfinished draft");
-        Ok(CheckResult {
-            similarity: Some(85.0),
-            claims: vec![Claim::new("The saved draft can be reopened", saved, "Read the saved draft from the temporary project.")],
-            ..CheckResult::new(self.id(), cx.round, saved, "Checked the synthetic saved draft.")
-        })
+        Ok(saved_draft_result(cx.ws, cx.round))
+    }
+}
+
+fn saved_draft_result(ws: &Workspace, round: u32) -> CheckResult {
+    let saved = std::fs::read_to_string(ws.app_dir().join("draft.txt")).ok().as_deref() == Some("unfinished draft");
+    CheckResult {
+        similarity: Some(85.0),
+        claims: vec![Claim::new("The saved draft can be reopened", saved, "Read the saved draft from the temporary project.")],
+        ..CheckResult::new("saved-draft", round, saved, "Checked the synthetic saved draft.")
     }
 }
 
@@ -66,6 +70,15 @@ fn reply(text: &str) -> Result<TurnResult, ToolError> {
 }
 
 fn run(ws: &mut Workspace, turns: VecDeque<Result<TurnResult, ToolError>>, max_rounds: u32) -> (String, Vec<Vec<Msg>>) {
+    run_with_extensions(ws, turns, max_rounds, Default::default())
+}
+
+fn run_with_extensions(
+    ws: &mut Workspace,
+    turns: VecDeque<Result<TurnResult, ToolError>>,
+    max_rounds: u32,
+    extensions: extensions::Extensions,
+) -> (String, Vec<Vec<Msg>>) {
     let mut worker = check_worker(ws, false);
     let seen = Arc::default();
     let model = Scripted { turns, seen: Arc::clone(&seen) };
@@ -85,10 +98,167 @@ fn run(ws: &mut Workspace, turns: VecDeque<Result<TurnResult, ToolError>>, max_r
     };
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(PlannedKind));
-    let opts = RunOptions { message: Some("Keep unfinished drafts".into()), kinds, max_rounds, good_enough: 80.0, ..RunOptions::default() };
-    let summary = worker.run(ws, entry, Some(api), None, &opts).unwrap();
+    let opts = RunOptions { message: Some("Keep unfinished drafts".into()), kinds, extensions, max_rounds, good_enough: 80.0, ..RunOptions::default() };
+    let summary = worker.run(ws, entry, Some(api), None, KeptHistory::default(), &opts).unwrap();
     let requests = seen.lock().unwrap().clone();
     (summary, requests)
+}
+
+#[derive(Debug)]
+struct UnavailableRequiredExtension;
+
+#[test]
+fn cached_checks_still_require_the_current_extension_obligations() {
+    use std::cell::Cell;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Cached verification", "Retain a saved draft", TargetRef::None).unwrap();
+    completed_plan(&ws);
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.app_dir().join("draft.txt"), "unfinished draft").unwrap();
+    let mut worker = check_worker(&ws, false);
+    worker.self_check = Some((Arc::new(PlannedKind), 80.0));
+    let runs = Cell::new(0);
+    for round in [1, 2] {
+        let results = worker
+            .checks_unless_unchanged(&ws, &PlannedKind, round, || {
+                runs.set(runs.get() + 1);
+                Ok(vec![saved_draft_result(&ws, round)])
+            })
+            .unwrap();
+        assert_eq!(results[0].round, round);
+        assert!(results.iter().all(|check| check.good(80.0)));
+        ws.manifest.checks.extend(results);
+        ws.save().unwrap();
+    }
+    assert_eq!(runs.get(), 1, "the second round really reused a passing observation");
+    let mut extensions = extensions::Extensions::default();
+    extensions.register(Arc::new(UnavailableRequiredExtension)).unwrap();
+    let summary = worker.finish_checks(&mut ws, 2, 80.0, &extensions).unwrap();
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+    assert!(summary.contains("required fixture verification"), "{summary}");
+
+    let state = craft_anything_engine::extensions::planning::load_project_strict(&ws.investigation_dir()).unwrap();
+    let mut plan = state.plan.unwrap();
+    plan.phases[0].status = craft_anything_engine::build_plan::PhaseStatus::Todo;
+    let mut session = craft_anything_engine::Session::isolated(&dir.path().join("config"));
+    session.open_project(Project::open(&ws.investigation_dir()).unwrap()).unwrap();
+    Engine::new(session).call("core_build_plan_update", json!({"plan":plan,"based_on_revision":state.revision}), CallOptions::new(Caller::Agent)).unwrap();
+    let results = worker
+        .checks_unless_unchanged(&ws, &PlannedKind, 3, || {
+            runs.set(runs.get() + 1);
+            Ok(vec![saved_draft_result(&ws, 3)])
+        })
+        .unwrap();
+    assert_eq!(runs.get(), 1, "planning metadata does not rebuild an unchanged app");
+    ws.manifest.checks.extend(results);
+    let summary = worker.finish_checks(&mut ws, 3, 80.0, &extensions::Extensions::default()).unwrap();
+    assert_eq!(ws.manifest.status, Status::Incomplete, "cached checks cannot finish a reopened phase");
+    assert!(!summary.starts_with("Ready:"));
+}
+
+#[test]
+fn a_higher_quality_target_cannot_reuse_a_lower_targets_recorded_round() {
+    use craft_anything_engine::workspace::progress::BuildProgress;
+    use std::cell::Cell;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Changed quality", "Retain a saved draft", TargetRef::None).unwrap();
+    completed_plan(&ws);
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.app_dir().join("draft.txt"), "unfinished draft").unwrap();
+    let mut first = check_worker(&ws, false);
+    first.self_check = Some((Arc::new(PlannedKind), 80.0));
+    let runs = Cell::new(0);
+    let mut observed = first
+        .checks_unless_unchanged(&ws, &PlannedKind, 1, || {
+            runs.set(runs.get() + 1);
+            Ok(vec![saved_draft_result(&ws, 1)])
+        })
+        .unwrap();
+    observed[0].good_enough = Some(80.0);
+    assert!(observed[0].good(80.0));
+    ws.manifest.checks.extend(observed);
+    ws.save().unwrap();
+    let progress = BuildProgress { checked: first.kept_checks.lock().unwrap().saved_for(1), ..BuildProgress::default() };
+
+    let mut next = check_worker(&ws, false);
+    next.self_check = Some((Arc::new(PlannedKind), 90.0));
+    *next.kept_checks.lock().unwrap() = kept_check::KeptChecks::from_saved(&progress, &ws);
+    let mut again = next
+        .checks_unless_unchanged(&ws, &PlannedKind, 2, || {
+            runs.set(runs.get() + 1);
+            Ok(vec![saved_draft_result(&ws, 2)])
+        })
+        .unwrap();
+    for check in &mut again {
+        if check.good_enough.is_none() {
+            check.good_enough = Some(90.0);
+        }
+    }
+    assert!(!again[0].good(90.0), "a result measured at 85% cannot meet the new 90% target by retaining an old 80% bar");
+    assert_eq!(runs.get(), 2, "a changed quality target checks again");
+    ws.manifest.checks.extend(again);
+    next.finish_checks(&mut ws, 2, 90.0, &extensions::Extensions::default()).unwrap();
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+}
+
+#[test]
+fn changing_the_picture_threshold_rechecks_an_unchanged_app() {
+    use std::cell::Cell;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Changed picture policy", "Retain a saved draft", TargetRef::None).unwrap();
+    completed_plan(&ws);
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.app_dir().join("draft.txt"), "unfinished draft").unwrap();
+    let mut worker = check_worker(&ws, false);
+    worker.self_check = Some((Arc::new(PlannedKind), 90.0));
+    worker.engine.session().settings.build.picture_good_enough = Some(80.0);
+    let runs = Cell::new(0);
+    let check = |ws: &Workspace, round| {
+        worker
+            .checks_unless_unchanged(ws, &PlannedKind, round, || {
+                runs.set(runs.get() + 1);
+                let mut observed = saved_draft_result(ws, round);
+                observed.good_enough = worker.engine.session().settings.build.picture_good_enough;
+                Ok(vec![observed])
+            })
+            .unwrap()
+    };
+    let first = check(&ws, 1);
+    assert!(first[0].good(90.0), "the explicit picture target was 80%");
+    ws.manifest.checks.extend(first);
+    ws.save().unwrap();
+    worker.engine.session().settings.build.picture_good_enough = Some(90.0);
+    let again = check(&ws, 2);
+    assert!(!again[0].good(90.0), "a changed picture target must not borrow an old explicit bar");
+    assert_eq!(runs.get(), 2);
+    ws.manifest.checks.extend(again);
+    worker.finish_checks(&mut ws, 2, 90.0, &extensions::Extensions::default()).unwrap();
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+}
+
+impl extensions::WorkflowExtension for UnavailableRequiredExtension {
+    fn id(&self) -> &'static str {
+        "required-fixture"
+    }
+    fn assess(&self, _: &Workspace, _: f64) -> Result<extensions::Assessment, ToolError> {
+        Err(ToolError::unavailable("The required fixture verification is unavailable."))
+    }
+}
+
+#[test]
+fn a_required_extension_error_cannot_be_replaced_by_passing_builtin_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Required extension", "Retain a saved draft", TargetRef::None).unwrap();
+    completed_plan(&ws);
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.app_dir().join("draft.txt"), "unfinished draft").unwrap();
+    let mut extensions = extensions::Extensions::default();
+    extensions.register(Arc::new(UnavailableRequiredExtension)).unwrap();
+    let (summary, requests) = run_with_extensions(&mut ws, VecDeque::from([reply("The saved draft can be reopened.")]), 2, extensions);
+    assert_eq!(requests.len(), 1);
+    assert!(ws.manifest.checks.iter().all(|check| check.good(80.0)));
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+    assert!(summary.contains("required fixture verification"), "{summary}");
 }
 
 #[test]

@@ -48,10 +48,10 @@ fn damaged_unknown_ledger(damage: &str) {
     ws.manifest.checks = vec![CheckResult::new("app-screenshot", 1, true, "The synthetic comparison passes.")];
     ws.save().unwrap();
     // Check-only citations intentionally do not need to open project metadata or evidence files.
-    let state = ws.investigation_dir().join("investigation/state.json");
+    let state = ws.investigation_dir().join("extensions/planning/state.json");
     let mut investigation: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
-    investigation["build_plan"]["acceptance"][0]["evidence_ids"] = json!([]);
-    investigation["build_plan"]["acceptance"][0]["checks"] = json!([{"check":"app-screenshot","round":1}]);
+    investigation["plan"]["acceptance"][0]["evidence_ids"] = json!([]);
+    investigation["plan"]["acceptance"][0]["checks"] = json!([{"check":"app-screenshot","round":1}]);
     std::fs::write(&state, serde_json::to_vec_pretty(&investigation).unwrap()).unwrap();
     let project = Project::open(&ws.investigation_dir()).unwrap();
     let unknown = Unknown::new("The required save workflow is unobserved", "rebuild", Severity::High);
@@ -68,7 +68,7 @@ fn damaged_unknown_ledger(damage: &str) {
         _ => panic!("unknown fixture damage"),
     }
     let mut worker = check_worker(&ws, false);
-    worker.finish_checks(&mut ws, 1, 90.0).unwrap();
+    worker.finish_checks(&mut ws, 1, 90.0, &extensions::Extensions::default()).unwrap();
     assert_eq!(ws.manifest.status, Status::Incomplete, "unreadable questions are not an empty question list ({damage})");
     assert!(ws.manifest.note.contains("question") || ws.manifest.note.contains("investigation"), "{}", ws.manifest.note);
     worker.self_check = Some((Arc::new(ComparedKind), 90.0));
