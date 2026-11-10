@@ -104,5 +104,7 @@ extension still assesses completion after the current checks, including reused v
       fix pass, with focused RED/GREEN evidence; record any deferred minor findings.
 - [x] Update roadmap, STATUS, extension/migration documentation and the local devlog with exact
       tested/not-tested scope. Report reduction in shared-file planning coupling.
-- [ ] Push the named branch and open its PR into fork main, referencing the older PR as superseded
+- [x] Push the named branch and open its PR into fork main, referencing the older PR as superseded
       only after the new PR exists. Leave main unmerged and retain the worktree for review.
+
+Published as [PR #3](https://github.com/mountogdengc/craft-anything/pull/3); PR #2 is superseded. Main remains unmerged.
