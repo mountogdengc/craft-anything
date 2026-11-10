@@ -39,11 +39,58 @@ impl WorkflowExtension for PlanningExtension {
         let review = review(ws, good_enough)?;
         if review.complete() { Ok(Assessment::ready()) } else { Ok(Assessment::blocked(review.explanation(), review.refinement_prompt())) }
     }
+    fn assess_refinement(&self, ws: &Workspace, good_enough: f64, unrefinable_checks: &[String]) -> Result<Assessment, ToolError> {
+        let review = review(ws, good_enough)?;
+        if review.complete() {
+            return Ok(Assessment::ready());
+        }
+        if !unrefinable_checks.is_empty()
+            && review.verification_issue.is_none()
+            && let Some(plan) = review.plan.as_ref()
+            && only_unavailable_checks(plan, &review.blockers, &ws.manifest.checks, good_enough, unrefinable_checks)
+        {
+            return Ok(Assessment::blocked_without_refinement(review.explanation()));
+        }
+        Ok(Assessment::blocked(review.explanation(), review.refinement_prompt()))
+    }
+}
+
+/// A previously verified criterion may become unverifiable when its checker loses an oracle.
+/// Only that case is non-actionable: unfinished phases, pending criteria, missing history and
+/// other extension obligations still get their own refinement opportunity.
+fn only_unavailable_checks(
+    plan: &craft_anything_engine::build_plan::BuildPlan,
+    blockers: &[craft_anything_engine::build_plan::PlanBlocker],
+    checks: &[CheckResult],
+    good_enough: f64,
+    unrefinable: &[String],
+) -> bool {
+    use craft_anything_engine::build_plan::{AcceptanceStatus, BlockerKind};
+    let Some(latest) = checks.iter().map(|check| check.round).max() else { return false };
+    !blockers.is_empty()
+        && blockers.iter().all(|blocker| {
+            if blocker.kind != BlockerKind::AcceptanceUnverified {
+                return false;
+            }
+            let Some(criterion) = plan.acceptance.iter().find(|criterion| criterion.id == blocker.item_id) else { return false };
+            criterion.status == AcceptanceStatus::Verified
+                && !criterion.checks.is_empty()
+                && criterion.checks.iter().all(|reference| {
+                    if reference.verify(checks, good_enough).is_ok() {
+                        return true;
+                    }
+                    let original = checks.iter().filter(|check| check.round == reference.round).cloned().collect::<Vec<_>>();
+                    reference.verify(&original, 0.0).is_ok()
+                        && unrefinable.contains(&reference.check)
+                        && checks.iter().any(|check| check.round == latest && check.check == reference.check && !check.good(good_enough))
+                })
+        })
 }
 
 #[derive(Debug)]
 pub(crate) struct Review {
     pub missing: bool,
+    plan: Option<craft_anything_engine::build_plan::BuildPlan>,
     pub blockers: Vec<craft_anything_engine::build_plan::PlanBlocker>,
     pub verification_issue: Option<String>,
 }
@@ -78,7 +125,8 @@ pub(crate) fn review(ws: &Workspace, good_enough: f64) -> Result<Review, ToolErr
     };
     Ok(Review {
         missing: plan.is_none(),
-        blockers: plan.map(|plan| plan.completion_blockers(&ws.manifest.checks, good_enough)).unwrap_or_default(),
+        blockers: plan.as_ref().map(|plan| plan.completion_blockers(&ws.manifest.checks, good_enough)).unwrap_or_default(),
+        plan,
         verification_issue,
     })
 }

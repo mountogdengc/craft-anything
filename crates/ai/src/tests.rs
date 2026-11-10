@@ -260,6 +260,21 @@ fn a_saved_program_that_is_gone_is_named_by_test_and_doctor() {
     let reach = h.check_reachability();
     let nowhere = reach.iter().find(|(name, _)| name == "Nowhere").map(|(_, r)| r.clone()).unwrap();
     assert_eq!(nowhere, Err(format!("there's no program at {gone}")));
+
+    // What Settings says: each AI whose saved program is gone, and what runs instead. One whose
+    // saved program is there, that has none saved, or that has nothing to run instead (doctor
+    // says that one), isn't listed.
+    let there = dir.path().join("agent-here");
+    std::fs::write(&there, "").unwrap();
+    let mut kept = backend("Kept", "cargo");
+    kept.options.command = Some(there.display().to_string());
+    h.add_backend_with(kept, None).unwrap();
+    let mut usual = backend("Unsaved", "cargo");
+    usual.options.command = None;
+    h.add_backend_with(usual, None).unwrap();
+    let replaced = h.replaced_programs();
+    assert_eq!(replaced.get("Usual").map(String::as_str), Some("cargo"));
+    assert!(!replaced.contains_key("Nowhere") && !replaced.contains_key("Kept") && !replaced.contains_key("Unsaved"), "{replaced:?}");
 }
 
 /// Every known agent with an adapter of its own is offered when adding a coding agent.
@@ -821,6 +836,47 @@ input.on('line', line => {
     }
 }
 
+/// A stand-in server that answers `GET <path>` from `routes` and 404 otherwise; its `/v1` address.
+pub(crate) fn serve_routes(routes: &'static [(&'static str, &'static str)]) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&got);
+            let path = head.split_whitespace().nth(1).unwrap_or_default().to_string();
+            let (status, body) = routes.iter().find(|(p, _)| *p == path).map_or(("404 Not Found", "not here"), |(_, b)| ("200 OK", *b));
+            let _ = write!(s, "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    base
+}
+
+/// #1434: FastFlowLM's `/models` lists every model it can download; taking the first started a
+/// 5.5 GB download and unloaded the model in use. A chat model the server says is loaded comes
+/// first; without `/api/ps`, or with nothing loaded, the first chat model listed is still used.
+#[test]
+fn a_server_added_without_a_model_gets_the_one_it_has_loaded() {
+    let (h, _d) = hub();
+    const CATALOGUE: &str = r#"{"object":"list","data":[{"id":"deepseek-r1:8b"},{"id":"gemma3:1b"},{"id":"qwen3.8-mtp-uncensored:27b"}]}"#;
+    let flm = serve_routes(&[
+        ("/v1/models", CATALOGUE),
+        ("/api/ps", r#"{"models":[{"name":"embed","model":"nomic-embed-text"},{"name":"qwen3.8-mtp-uncensored:27b","model":"qwen3.8-mtp-uncensored:27b"}]}"#),
+    ]);
+    assert_eq!(h.add_server("Npu", &flm, None, None).unwrap(), "qwen3.8-mtp-uncensored:27b", "the loaded chat model, not an embedding one");
+    assert_eq!(h.add_server("Named", &flm, Some("gemma3:1b"), None).unwrap(), "gemma3:1b", "a named model still wins");
+    let idle = serve_routes(&[("/v1/models", CATALOGUE), ("/api/ps", r#"{"models":[]}"#)]);
+    assert_eq!(h.add_server("Idle", &idle, None, None).unwrap(), "deepseek-r1:8b", "nothing loaded: the list's first");
+    let no_ps = serve_routes(&[("/v1/models", CATALOGUE)]);
+    assert_eq!(h.add_server("Studio", &no_ps, None, None).unwrap(), "deepseek-r1:8b", "no /api/ps: the list's first");
+}
+
 /// #54, #98: a server on another computer is added by its address, with a model that can chat
 /// when none is named; one that doesn't answer with its models isn't added.
 #[test]
@@ -840,6 +896,58 @@ fn a_server_is_added_by_its_address() {
     assert!(h.add_server("No scheme", "192.168.1.20:11434/v1", None, None).is_err());
     assert!(h.add_server(" ", &url, None, None).is_err());
     assert_eq!(h.backends().len(), 2, "only the ones that answered");
+}
+
+/// #1429: a server that takes the request and doesn't list its models in time (still starting, or
+/// loading a model) is told to wait, not to check its address, and the message isn't repeated.
+#[test]
+fn a_server_that_was_reached_but_slow_is_told_to_wait() {
+    let (h, _d) = hub();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", l.local_addr().unwrap());
+    // Accepts and holds the connection without answering, for longer than the test waits.
+    std::thread::spawn(move || {
+        let held: Vec<_> = l.incoming().take(1).flatten().collect();
+        std::thread::sleep(Duration::from_secs(10));
+        drop(held);
+    });
+    let e = h.add_server_within("Slow box", &url, None, None, Duration::from_secs(2), &Default::default()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::TimedOut, "{e:?}");
+    let advice = e.remediation.clone().unwrap_or_default();
+    assert!(advice.contains("was reached") && advice.contains("2 seconds") && advice.contains("loading a model"), "{advice}");
+    assert!(!advice.contains("Check the address") && !advice.contains(&e.message), "{advice}");
+    assert!(h.backends().is_empty(), "nothing added");
+    // Nothing listening (port zero refuses): still told to check the address, without the message
+    // again in brackets.
+    let e = h.add_server("Nobody", "http://127.0.0.1:0/v1", None, None).unwrap_err();
+    let advice = e.remediation.clone().unwrap_or_default();
+    assert!(advice.contains("Check the address") && !advice.contains(&e.message), "{advice}");
+}
+
+/// #1429: adding a server that was reached but doesn't answer can be stopped while it's asked,
+/// instead of waiting out the minute, and nothing is added.
+#[test]
+fn adding_a_slow_server_can_be_stopped() {
+    let (h, _d) = hub();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let held: Vec<_> = l.incoming().take(1).flatten().collect();
+        std::thread::sleep(Duration::from_secs(10));
+        drop(held);
+    });
+    let cancel = craft_anything_engine::CancelToken::default();
+    let later = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        later.cancel();
+    });
+    let started = std::time::Instant::now();
+    let e = h.add_server_until("Slow box", &url, None, None, &cancel).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "stopped at once, not after the wait: {:?}", started.elapsed());
+    assert!(e.remediation.is_none(), "a stop isn't a bad address: {e:?}");
+    assert!(h.backends().is_empty(), "nothing added");
 }
 
 #[test]
@@ -1497,6 +1605,56 @@ fn hub_config_keys_and_test_backend() {
         assert_eq!(e.code, ErrorCode::BadSettings);
     }
     assert!(h.compare("Local", "Local", true).is_err());
+}
+
+/// #1358: a key saved for an API backend can be replaced or forgotten without removing the
+/// backend or its settings, so a rotated key isn't hidden behind an older one.
+#[test]
+fn a_saved_api_key_can_be_replaced_or_forgotten() {
+    let (h, _d) = hub();
+    add(&h, "OpenAI", BackendKind::Openai, "https://api.openai.com/v1", Some("sk-old"));
+    assert_eq!(h.stored_backend_keys().get("OpenAI"), Some(&true));
+    assert!(h.saved_backend_key("OpenAI").unwrap());
+    h.set_backend_key("OpenAI", " sk-new ").unwrap();
+    assert_eq!(h.keys.get("OpenAI").as_deref(), Some("sk-new"));
+    assert_eq!(h.key_for(&h.entry("OpenAI").unwrap()).unwrap(), "sk-new", "the replacement is the key a request uses");
+    h.remove_backend_key("OpenAI").unwrap();
+    assert_eq!(h.stored_backend_keys().get("OpenAI"), Some(&false));
+    assert!(!h.saved_backend_key("OpenAI").unwrap());
+    assert!(h.backends().iter().any(|b| b.name == "OpenAI"), "the backend stays");
+    assert!(h.set_backend_key("OpenAI", "   ").is_err(), "an empty key is refused");
+    assert!(h.set_backend_key("No such backend", "sk-new").is_err());
+    assert!(h.remove_backend_key("No such backend").is_err());
+    add(&h, "Agent", BackendKind::AgentCli, "", None);
+    assert!(!h.stored_backend_keys().contains_key("Agent"), "an agent app has no saved key here");
+    assert!(h.saved_backend_key("Agent").is_err());
+    assert!(h.set_backend_key("Agent", "sk-new").is_err(), "a coding agent keeps its own sign-in");
+    assert!(h.remove_backend_key("Agent").is_err());
+}
+
+/// A key save and another key or backend change wait for each other: a save can't write the key
+/// after a remove has deleted the backend and its key.
+#[test]
+fn a_key_save_waits_for_another_backend_change() {
+    let (h, _d) = hub();
+    add(&h, "OpenAI", BackendKind::Openai, "https://api.openai.com/v1", None);
+    let h = Arc::new(h);
+    let edit = h.backend_edits.lock().unwrap();
+    let (started, started_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            started.send(()).unwrap();
+            h.set_backend_key("OpenAI", "sk-new")
+        })
+    };
+    started_rx.recv().unwrap();
+    // While another change holds the lock, the save can't reach the keychain.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!worker.is_finished(), "the save waits for the other backend change");
+    drop(edit);
+    worker.join().unwrap().unwrap();
+    assert_eq!(h.keys.get("OpenAI").as_deref(), Some("sk-new"));
 }
 
 /// #369: when OpenRouter has no provider that supports tools for a model (404 once only those are

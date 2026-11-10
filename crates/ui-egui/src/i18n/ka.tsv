@@ -912,6 +912,7 @@ Read a Unity game's IL2CPP metadata	Unity თამაშის IL2CPP მეტ
 Read a game's files	თამაშის ფაილების წაკითხვა
 Read a project file	პროექტის ფაილის წაკითხვა
 Read a setting	პარამეტრის წაკითხვა
+Read a text file	ტექსტური ფაილის წაკითხვა
 Read an app's screen	აპის ეკრანის წაკითხვა
 Read bytes	ბაიტების წაკითხვა
 Read comment	კომენტარის წაკითხვა
@@ -1485,3 +1486,7 @@ About "{question}":	შეკითხვის შესახებ „{questi
 The project plan could not be read.	პროექტის გეგმის წაკითხვა ვერ მოხერხდა.
 Update the build plan	შექმნის გეგმის განახლება
 Keep the project phases, missing information and checks together in one plan.	პროექტის ფაზები, დაკარგული ინფორმაცია და შემოწმებები ერთ გეგმაში შეინახეთ.
+Connecting to {name}… {seconds} s	{name}-თან დაკავშირება… {seconds} წმ
+Stopped adding {name}.	{name}-ის დამატება შეჩერდა.
+It isn't there any more, so {program} runs in its place.	ის აღარ არის იქ, ამიტომ მის ნაცვლად {program} ეშვება.
+Use it	გამოყენება

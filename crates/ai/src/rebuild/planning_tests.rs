@@ -62,8 +62,8 @@ impl TargetKind for PlannedKind {
     fn goal(&self) -> &'static str {
         "a synthetic notebook"
     }
-    fn checks(&self, _: &Workspace) -> Vec<Box<dyn Check>> {
-        vec![Box::new(SavedDraftCheck)]
+    fn checks(&self, ws: &Workspace) -> Vec<Box<dyn Check>> {
+        if ws.mechanics_path().is_file() { vec![Box::new(kinds::MechanicsCheck)] } else { vec![Box::new(SavedDraftCheck)] }
     }
 }
 
@@ -138,6 +138,108 @@ fn run_recording_requirements(
 
 #[derive(Debug)]
 struct UnavailableRequiredExtension;
+
+fn legacy_mechanics_plan(ws: &mut Workspace, independent_work: bool) {
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    std::fs::write(ws.mechanics_path(), r#"{"values":[{"name":"walk speed","value":4.5,"source":"reference measurement"}]}"#).unwrap();
+    ws.manifest.checks = vec![CheckResult::new("mechanics", 1, true, "Legacy source literals matched.")];
+    ws.save().unwrap();
+    let mut saved = plan("done", "verified");
+    saved["acceptance"][0]["checks"] = json!([{"check":"mechanics","round":1}]);
+    if independent_work {
+        saved["phases"].as_array_mut().unwrap().push(json!({"id":"export","title":"Export drafts","goal":"Save an export","status":"todo"}));
+    }
+    let worker = check_worker(ws, false);
+    worker.attach(ws).unwrap();
+    worker.call("core_build_plan_update", json!({"based_on_revision":0,"plan":saved})).unwrap();
+}
+
+#[test]
+fn an_unavailable_measurement_does_not_retry_a_completed_implementation_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Measured work", "Keep observed behavior honest", TargetRef::None).unwrap();
+    legacy_mechanics_plan(&mut ws, false);
+    let turns = VecDeque::from([reply("The implementation is present."), reply("The comparison is unavailable."), reply("Still unavailable.")]);
+    let (_, requests) = run(&mut ws, turns, 2);
+    assert_eq!(requests.len(), 1, "a missing measurement cannot be supplied by repeating planning verification turns");
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+    assert!(ws.manifest.note.contains("not been measured"), "{}", ws.manifest.note);
+    assert!(!planning::review(&ws, 80.0).unwrap().complete());
+    assert!(ws.manifest.checks.last().unwrap().unknowns.iter().any(|item| item.contains("not been measured")));
+}
+
+#[test]
+fn an_unavailable_measurement_keeps_independent_unfinished_phases_actionable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Independent work", "Keep building independent features", TargetRef::None).unwrap();
+    legacy_mechanics_plan(&mut ws, true);
+    let turns = VecDeque::from([
+        reply("The current implementation still needs an export."),
+        tool("export", "build_file_write", json!({"path":"app/export.txt","content":"an independent export"})),
+        reply("The export is implemented; measurement remains unavailable."),
+    ]);
+    let (_, requests) = run(&mut ws, turns, 1);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(std::fs::read_to_string(ws.app_dir().join("export.txt")).unwrap(), "an independent export");
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+}
+
+#[test]
+fn an_unavailable_measurement_keeps_other_required_extensions_actionable() {
+    #[derive(Debug)]
+    struct ExportExtension;
+    impl extensions::WorkflowExtension for ExportExtension {
+        fn id(&self) -> &'static str {
+            "export-fixture"
+        }
+        fn assess(&self, ws: &Workspace, _: f64) -> Result<extensions::Assessment, ToolError> {
+            Ok(if ws.app_dir().join("export.txt").is_file() {
+                extensions::Assessment::ready()
+            } else {
+                extensions::Assessment::blocked("The export is missing.".into(), "Write the independent export.".into())
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Extension work", "Keep all required work", TargetRef::None).unwrap();
+    legacy_mechanics_plan(&mut ws, false);
+    let mut extensions = extensions::Extensions::default();
+    extensions.register(Arc::new(ExportExtension)).unwrap();
+    let turns = VecDeque::from([
+        reply("The implementation is present."),
+        tool("export", "build_file_write", json!({"path":"app/export.txt","content":"an independent export"})),
+        reply("The export is implemented; measurement remains unavailable."),
+    ]);
+    let (_, requests) = run_with_extensions(&mut ws, turns, 1, extensions);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(std::fs::read_to_string(ws.app_dir().join("export.txt")).unwrap(), "an independent export");
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+}
+
+#[test]
+fn a_saved_legacy_mechanics_round_is_rechecked_before_readiness() {
+    use craft_anything_engine::workspace::progress::BuildProgress;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Legacy check", "Retain honest verification", TargetRef::None).unwrap();
+    legacy_mechanics_plan(&mut ws, false);
+    let mut worker = check_worker(&ws, false);
+    worker.self_check = Some((Arc::new(PlannedKind), 80.0));
+    worker.checks_unless_unchanged(&ws, &PlannedKind, 1, || Ok(ws.manifest.checks.clone())).unwrap();
+    let progress = BuildProgress { checked: worker.kept_checks.lock().unwrap().saved_for(1), ..Default::default() };
+    assert!(progress.checked.is_some(), "the fixture has a saved legacy passing round");
+    *worker.kept_checks.lock().unwrap() = kept_check::KeptChecks::from_saved(&progress, &ws);
+    let ran = std::cell::Cell::new(false);
+    let checks = worker
+        .checks_unless_unchanged(&ws, &PlannedKind, 2, || {
+            ran.set(true);
+            worker.run_checks(&ws, &PlannedKind, 2)
+        })
+        .unwrap();
+    ws.manifest.checks.extend(checks);
+    worker.finish_checks(&mut ws, 2, 80.0, &Default::default()).unwrap();
+    assert!(ran.get(), "a saved legacy source-literal check cannot stand in for current mechanics verification");
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+}
 
 #[test]
 fn cached_checks_still_require_the_current_extension_obligations() {

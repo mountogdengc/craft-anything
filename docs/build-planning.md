@@ -97,6 +97,13 @@ and required readiness assessments. The default registry always includes plannin
 required extensions can be registered without replacing it. A failed required assessment blocks
 automatic completion and stops automatic refinement. Optional plugin checks are separate.
 
+Refinement and readiness are separate. If the only remaining planning blockers are previously
+verified check citations whose current measurements cannot be supplied by another builder turn,
+the run stops incomplete without repeatedly asking for verification. Unfinished phases, pending
+or uncited criteria, invalid citations and other required extensions still receive actionable
+refinement. Older cached mechanics results based on source literals are checked again before
+they can contribute to completion.
+
 Corrective API turns carry an optional named-tool requirement through the conversation interface.
 OpenAI-compatible native requests enforce it with `tool_choice`; text-protocol requests include it
 in their instructions. Anthropic retains automatic tool selection because current default models

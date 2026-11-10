@@ -51,7 +51,7 @@ fn essential_unknowns_block_final_readiness_and_the_builders_pass_message() {
     worker.finish_checks(&mut ws, 1, 90.0, &extensions::Extensions::default()).unwrap();
     assert_eq!(ws.manifest.status, Status::Incomplete);
     assert!(ws.manifest.note.contains("save and reopen"));
-    assert!(!self_check::report(&ws.manifest.checks, 90.0, &self_check::open_questions(&ws).unwrap()).contains("This would pass"));
+    assert!(!self_check::report(&ws.manifest.checks, 90.0, &self_check::open_questions(&ws).unwrap(), |_| true).contains("This would pass"));
 }
 
 struct UncomparedKind;

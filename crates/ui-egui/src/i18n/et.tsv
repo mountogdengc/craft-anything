@@ -893,6 +893,7 @@ Read a Unity game's IL2CPP metadata	Loe Unity mängu IL2CPP metaandmeid
 Read a game's files	Loe mängu faile
 Read a project file	Loe projektifaili
 Read a setting	Loe seadet
+Read a text file	Loe tekstifaili
 Read an app's screen	Loe rakenduse ekraani
 Read bytes	Loe baite
 Read comment	Loe kommentaari
@@ -1462,3 +1463,31 @@ In this project, {kind}: {choice}.	Selles projektis {kind}: {choice}.
 Couldn't change the approvals:	Kinnitusi ei õnnestunud muuta:
 What the builder may do without asking you, in this project.	Mida ehitaja tohib selles projektis sinult küsimata teha.
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	Vaikimisi järgib automaatrežiimi: kui see on sees, tehakse tagasipööratavad toimingud ära ja ülejäänud keeldutakse; kui see on väljas, küsib ehitaja.
+Connecting to {name}… {seconds} s	Ühendamine: {name}… {seconds} s
+Stopped adding {name}.	{name} lisamine peatati.
+It isn't there any more, so {program} runs in its place.	Seda pole enam seal, nii et selle asemel käivitub {program}.
+Use it	Kasuta seda
+# Planning entries drafted from English; native-speaker review is welcome.
+Needs more work	Vajab veel tööd
+There is work still to do. Continue builds on what is already there.	Tööd on veel teha. Jätkamine täiendab olemasolevat.
+Project plan	Projekti plaan
+{implemented} of {phases} phases implemented · {verified} of {criteria} criteria verified	{implemented} etappi {phases}-st teostatud · {verified} kriteeriumi {criteria}-st kontrollitud
+Pending	Ootel
+In progress	Pooleli
+Implemented	Teostatud
+Verified	Kontrollitud
+Needs verification	Vajab kontrollimist
+Required	Nõutav
+Optional	Valikuline
+Inputs and answers	Sisendid ja vastused
+Needed	Vajalik
+Requested	Küsitud
+Provided	Esitatud
+Deferred	Edasi lükatud
+Useful format: {format}	Sobiv vorming: {format}
+Needed for: {phases}	Vajalik etappidele: {phases}
+Provide details	Lisa üksikasjad
+About "{question}":	Teema „{question}“:
+The project plan could not be read.	Projekti plaani ei saanud lugeda.
+Update the build plan	Uuenda projekti plaani
+Keep the project phases, missing information and checks together in one plan.	Hoia projekti etapid, puuduv teave ja kontrollid ühes plaanis.
