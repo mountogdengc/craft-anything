@@ -654,6 +654,8 @@ complete while required checks or planned work remain unresolved.
       action observations from being treated as completed work.
 - [x] Require a confirmed planning save before implementation and correct unsaved planning replies
       within a bounded preparation handoff — claimed: Codex, branch bugfix/r5.8-planning-handoff-20261110
+- [ ] Integrate upstream through `76b52be`, retaining the native planning extension, confirmed-save
+      handoff, project migrations and ignored experiments — claimed: Codex, branch chore/r5.8-upstream-sync-20261110
 - [ ] Add explicit scope revisions tied to the person's changed request, retaining the previous
       requirements and reason for reduction; ordinary plan progress updates preserve required scope.
 
