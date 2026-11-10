@@ -652,6 +652,8 @@ complete while required checks or planned work remain unresolved.
       when their checker or engine implementation changes. Native planning remains required.
 - [ ] Reconcile textual tool fallback handling with genuine tool results and prevent speculative
       action observations from being treated as completed work.
+- [ ] Require a confirmed planning save before implementation and correct unsaved planning replies
+      within a bounded preparation handoff — claimed: Codex, branch bugfix/r5.8-planning-handoff-20261110
 - [ ] Add explicit scope revisions tied to the person's changed request, retaining the previous
       requirements and reason for reduction; ordinary plan progress updates preserve required scope.
 
