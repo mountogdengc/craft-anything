@@ -5,6 +5,26 @@ use crate::model::{Block, Msg, StopReason, TurnResult};
 use craft_anything_engine::workspace::Claim;
 use std::collections::{BTreeSet, VecDeque};
 
+struct PlanningScripted {
+    inner: Scripted,
+    requirements: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl crate::model::ChatModel for PlanningScripted {
+    fn turn(
+        &mut self,
+        req: &crate::model::TurnRequest<'_>,
+        delta: &mut dyn FnMut(crate::model::Delta),
+        stop: &crate::model::Stop,
+    ) -> Result<TurnResult, ToolError> {
+        self.requirements.lock().unwrap().push(req.required_tool.map(str::to_string));
+        self.inner.turn(req, delta, stop)
+    }
+    fn model(&self) -> String {
+        "scripted".into()
+    }
+}
+
 struct PlannedKind;
 struct SavedDraftCheck;
 
@@ -79,9 +99,20 @@ fn run_with_extensions(
     max_rounds: u32,
     extensions: extensions::Extensions,
 ) -> (String, Vec<Vec<Msg>>) {
+    let (summary, requests, _) = run_recording_requirements(ws, turns, max_rounds, extensions);
+    (summary, requests)
+}
+
+fn run_recording_requirements(
+    ws: &mut Workspace,
+    turns: VecDeque<Result<TurnResult, ToolError>>,
+    max_rounds: u32,
+    extensions: extensions::Extensions,
+) -> (String, Vec<Vec<Msg>>, Vec<Option<String>>) {
     let mut worker = check_worker(ws, false);
     let seen = Arc::default();
-    let model = Scripted { turns, seen: Arc::clone(&seen) };
+    let requirements = Arc::default();
+    let model = PlanningScripted { inner: Scripted { turns, seen: Arc::clone(&seen) }, requirements: Arc::clone(&requirements) };
     let slot = ModelSlot { name: "Scripted".into(), model: Box::new(model), local: true, effort: None, max_turns: 12, context_tokens: 0 };
     let enabled = BTreeSet::from([craft_anything_engine::Toolset::Core, craft_anything_engine::Toolset::Build]);
     let api = ApiConversation::start_with(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default(), enabled).unwrap();
@@ -101,7 +132,8 @@ fn run_with_extensions(
     let opts = RunOptions { message: Some("Keep unfinished drafts".into()), kinds, extensions, max_rounds, good_enough: 80.0, ..RunOptions::default() };
     let summary = worker.run(ws, entry, Some(api), None, KeptHistory::default(), &opts).unwrap();
     let requests = seen.lock().unwrap().clone();
-    (summary, requests)
+    let requirements = requirements.lock().unwrap().clone();
+    (summary, requests, requirements)
 }
 
 #[derive(Debug)]
@@ -265,11 +297,80 @@ fn a_required_extension_error_cannot_be_replaced_by_passing_builtin_checks() {
 fn a_missing_plan_stops_before_an_implementation_turn() {
     let dir = tempfile::tempdir().unwrap();
     let mut ws = Workspace::create(dir.path(), "Notebook", "Build a notebook", TargetRef::None).unwrap();
-    let (summary, requests) = run(&mut ws, VecDeque::from([reply("I have a plan.")]), 2);
-    assert_eq!(requests.len(), 1, "an unsaved plan cannot advance to implementation");
+    let turns = VecDeque::from([reply("I have a plan."), reply("The plan is saved."), reply("No tool result returned.")]);
+    let (summary, requests) = run(&mut ws, turns, 2);
+    assert_eq!(requests.len(), 3, "unsaved planning corrections cannot advance to implementation");
     assert_eq!(ws.manifest.status, Status::Incomplete);
     assert!(ws.manifest.checks.is_empty());
     assert!(summary.contains("not been recorded"), "{summary}");
+    assert!(!ws.app_dir().join("draft.txt").exists());
+}
+
+#[test]
+fn an_unsaved_planning_reply_is_corrected_before_implementation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Notebook", "Build a notebook", TargetRef::None).unwrap();
+    let turns = VecDeque::from([
+        reply("I saved the plan. No application files were changed."),
+        tool("plan", "core_build_plan_update", json!({"based_on_revision":0,"plan":plan("todo","pending")})),
+        reply("The plan is now saved."),
+        tool("write", "build_file_write", json!({"path":"app/draft.txt","content":"unfinished draft"})),
+        tool("implement", "core_build_plan_update", json!({"based_on_revision":1,"plan":plan("done","implemented")})),
+        reply("The draft is implemented, and needs verification."),
+        tool("verify", "core_build_plan_update", json!({"based_on_revision":2,"plan":plan("done","verified")})),
+        reply("The recorded check confirms the saved draft."),
+    ]);
+    let (summary, requests, requirements) = run_recording_requirements(&mut ws, turns, 2, Default::default());
+    assert_eq!(ws.manifest.status, Status::Ready, "{summary}");
+    assert_eq!(std::fs::read_to_string(ws.app_dir().join("draft.txt")).unwrap(), "unfinished draft");
+    let saved = craft_anything_engine::extensions::planning::load_project_strict(&ws.investigation_dir()).unwrap();
+    assert_eq!(saved.revision, 3);
+    assert_eq!(saved.plan.unwrap().goal, "Save unfinished work and reopen it");
+    let correction = requests[1].last().unwrap().text();
+    assert!(correction.contains("core_build_plan_update") && correction.contains("not saved"), "{correction}");
+    assert_eq!(requests.len(), 8, "a successful correction must release the implementation turn");
+    assert_eq!(requirements, vec![None, Some("core_build_plan_update".into()), None, None, None, None, None, None]);
+}
+
+#[test]
+fn repeated_unsaved_planning_claims_stop_after_bounded_corrections() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Notebook", "Build a notebook", TargetRef::None).unwrap();
+    let turns = VecDeque::from([
+        reply("The plan is saved."),
+        reply("The plan is definitely saved."),
+        reply("The tool did not return a result."),
+        tool("must-not-write", "build_file_write", json!({"path":"app/draft.txt","content":"unexpected implementation"})),
+    ]);
+    let (summary, requests) = run(&mut ws, turns, 2);
+    assert_eq!(requests.len(), 3, "initial planning plus two corrective turns, then stop");
+    assert_eq!(ws.manifest.status, Status::Incomplete);
+    assert!(ws.manifest.checks.is_empty());
+    assert!(summary.contains("not been recorded"), "{summary}");
+    assert!(planning::load(&ws).unwrap().is_none());
+    assert!(!ws.app_dir().join("draft.txt").exists());
+}
+
+#[test]
+fn a_rejected_plan_save_can_be_corrected_without_losing_the_tool_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "Notebook", "Build a notebook", TargetRef::None).unwrap();
+    let turns = VecDeque::from([
+        tool("stale", "core_build_plan_update", json!({"based_on_revision":99,"plan":plan("todo","pending")})),
+        reply("The plan was saved."),
+        tool("corrected", "core_build_plan_update", json!({"based_on_revision":0,"plan":plan("todo","pending")})),
+        reply("The corrected plan was saved."),
+        reply("Implementation remains pending."),
+    ]);
+    let (_, requests) = run(&mut ws, turns, 0);
+    let state = craft_anything_engine::extensions::planning::load_project_strict(&ws.investigation_dir()).unwrap();
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.plan.unwrap().phases[0].id, "storage");
+    assert!(
+        requests[1].last().unwrap().blocks.iter().any(|block| matches!(block, Block::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "stale"))
+    );
+    assert!(requests[2].last().unwrap().text().contains("based_on_revision"));
+    assert_eq!(ws.manifest.status, Status::Incomplete, "saving a plan does not complete the implementation");
     assert!(!ws.app_dir().join("draft.txt").exists());
 }
 

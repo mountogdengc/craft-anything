@@ -111,6 +111,12 @@ names (`git merge-base --is-ancestor <fix> <release tag>`), and check the messag
 
 ## Tests
 
+**A builder claimed a plan was saved without making a tool call.** Repeating the same request
+kept producing prose completion claims. Re-read durable state before advancing; when setup is
+missing, send bounded corrective feedback with the current revision and request the save tool
+where supported. Release that request only after a genuine successful result, including across
+provider retries, and test a prose-only reply before the first real save.
+
 **A heartbeat sampled before shutdown raced a successful stop.** A child could write between
 the baseline read and `stop()`, failing the descendant cleanup test even when cleanup worked.
 Probe for exit instead of timing writes: the child holds a file lock the system releases only

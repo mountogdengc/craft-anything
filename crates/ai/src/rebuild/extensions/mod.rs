@@ -20,6 +20,11 @@ pub struct Preparation {
     pub prompt: String,
     pub next_prompt: String,
     pub missing: String,
+    /// A corrective turn when setup returned without satisfying the persisted obligation.
+    /// The host allows at most two corrections, and never infers completion from reply text.
+    pub correction: Option<String>,
+    /// API hint for corrective turns; persisted state remains the authoritative check.
+    pub correction_tool: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]

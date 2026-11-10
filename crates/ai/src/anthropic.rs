@@ -373,7 +373,7 @@ mod tests {
             ToolDef { name: "a".into(), description: "d".into(), schema: json!({"type": "object"}) },
             ToolDef { name: "b".into(), description: "d".into(), schema: json!({"type": "object"}) },
         ];
-        let b = a.body(&TurnRequest { system: "sys", messages: &msgs, tools: &tools, effort: Effort::High, max_tokens: MAX_TOKENS });
+        let b = a.body(&TurnRequest { system: "sys", messages: &msgs, tools: &tools, required_tool: None, effort: Effort::High, max_tokens: MAX_TOKENS });
         assert_eq!(b["model"], "claude-opus-5-5");
         assert_eq!(b["thinking"]["type"], "adaptive");
         assert_eq!(b["output_config"]["effort"], "high");
@@ -386,7 +386,11 @@ mod tests {
         assert!(a.headers().iter().any(|(k, v)| *k == "anthropic-beta" && v == FALLBACK_BETA));
         let mut off = a.clone();
         off.fallbacks = false;
-        assert!(off.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 10 }).get("fallbacks").is_none());
+        assert!(
+            off.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 10 })
+                .get("fallbacks")
+                .is_none()
+        );
         assert!(off.headers().iter().all(|(k, _)| *k != "anthropic-beta"));
     }
 
@@ -401,7 +405,7 @@ mod tests {
             let client = Anthropic::new(None, "sk-test".into(), model);
             for effort in [Effort::None, Effort::Minimal] {
                 assert_eq!(effort_for(model, effort), Effort::Low);
-                let body = client.body(&TurnRequest { system: "s", messages: &[], tools: &[], effort, max_tokens: 10 });
+                let body = client.body(&TurnRequest { system: "s", messages: &[], tools: &[], required_tool: None, effort, max_tokens: 10 });
                 assert_eq!(body["output_config"]["effort"], "low");
                 assert_eq!(Effort::parse(effort.as_str()), Some(effort));
             }
@@ -413,7 +417,7 @@ mod tests {
         assert_eq!(Effort::Max.within(&[]), Effort::Max);
         assert_eq!(Effort::parse("extreme"), None);
         let a = Anthropic::new(None, "k".into(), "claude-sonnet-4-6");
-        let b = a.body(&TurnRequest { system: "s", messages: &[], tools: &[], effort: Effort::Xhigh, max_tokens: 10 });
+        let b = a.body(&TurnRequest { system: "s", messages: &[], tools: &[], required_tool: None, effort: Effort::Xhigh, max_tokens: 10 });
         assert_eq!(b["output_config"]["effort"], "high");
     }
 

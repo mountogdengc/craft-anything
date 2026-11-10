@@ -1251,6 +1251,48 @@ fn json_text_tool_calls_execute_through_both_protocols() {
 }
 
 #[test]
+fn a_required_tool_stays_required_after_failure_and_is_released_after_success() {
+    let call = |id: &str, input: Value| {
+        chat_sse(&[json!({"choices":[{
+            "delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{
+                "name":"core_unknown_add","arguments":input.to_string()
+            }}]},"finish_reason":"tool_calls"
+        }]})])
+    };
+    let (url, seen) = mock(vec![
+        (200, "text/event-stream", call("wrong", json!({"question": ["What must be verified?"]}))),
+        (200, "text/event-stream", call("saved", json!({"question": "What must be verified?"}))),
+        (200, "text/event-stream", chat_sse(&[json!({"choices":[{"delta":{"content":"Recorded."},"finish_reason":"stop"}]})])),
+        (200, "text/event-stream", chat_sse(&[json!({"choices":[{"delta":{"content":"Nothing further."},"finish_reason":"stop"}]})])),
+    ]);
+    let (hub, _dir) = hub();
+    add(&hub, "Local", BackendKind::OpenaiCompatible, &url, None);
+    let mut conversation = hub.start(Some("Local"), true).unwrap();
+    conversation.require_tool(Some("core_unknown_add"));
+    let events = run(&mut conversation, "Record the unresolved check using the actual tool.");
+    let completed = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolFinished { tool, ok, .. } if tool == "core_unknown_add" => Some(*ok),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed, vec![false, true]);
+    assert_eq!(hub.engine.session().unknowns().count(), 1);
+    conversation.require_tool(None);
+    run(&mut conversation, "What remains?");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    for request in &seen[..2] {
+        assert_eq!(request.body["tool_choice"], json!({"type":"function","function":{"name":"core_unknown_add"}}));
+    }
+    assert_eq!(seen[2].body["tool_choice"], "auto", "the real successful result releases the constraint");
+    assert_eq!(seen[3].body["tool_choice"], "auto", "the next workflow can use normal tool selection");
+    assert_eq!(seen[1].body["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], "wrong");
+    assert_eq!(seen[2].body["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], "saved");
+}
+
+#[test]
 fn react_action_errors_still_reach_the_tool_loop() {
     let replies = ["Action: missing_tool\nAction Input: {}", "Action: core_session_show\nAction Input: {}", "Final Answer: Nothing open."]
         .map(|text| (200, "text/event-stream", chat_sse(&[json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]})])));
@@ -1350,7 +1392,7 @@ fn json_text_recovery_preserves_non_actions_and_stop_reasons() {
     use crate::model::{Effort, Msg, Stop, StopReason, ToolDef, TurnRequest};
     let tools = [ToolDef { name: "look".into(), description: "Look at a file".into(), schema: json!({"type":"object"}) }];
     let messages = [Msg::user_text("check")];
-    let request = TurnRequest { system: "S", messages: &messages, tools: &tools, effort: Effort::Low, max_tokens: 100 };
+    let request = TurnRequest { system: "S", messages: &messages, tools: &tools, required_tool: None, effort: Effort::Low, max_tokens: 100 };
     for react in [false, true] {
         for (text, finish, expected) in [
             (r#"{"name":"unknown","arguments":{}}"#, "stop", StopReason::EndTurn),
@@ -1380,7 +1422,7 @@ fn json_text_recovery_preserves_non_actions_and_stop_reasons() {
         let (url, _seen) = mock(vec![(200, "text/event-stream", reply)]);
         let mut model = openai::OpenAi::compatible("Local", &url, None, "scripted");
         model.auto_react = automatic;
-        let request = TurnRequest { system: "S", messages: &messages, tools: offered, effort: Effort::Low, max_tokens: 100 };
+        let request = TurnRequest { system: "S", messages: &messages, tools: offered, required_tool: None, effort: Effort::Low, max_tokens: 100 };
         assert!(model.turn(&request, &mut |_| {}, &Stop::default()).unwrap().message.tool_uses().is_empty());
     }
 }
@@ -1390,7 +1432,7 @@ fn native_tool_calls_are_not_duplicated_by_json_text() {
     use crate::model::{Effort, Msg, Stop, StopReason, ToolDef, TurnRequest};
     let tools = [ToolDef { name: "look".into(), description: "Look at a file".into(), schema: json!({"type":"object"}) }];
     let messages = [Msg::user_text("check")];
-    let request = TurnRequest { system: "S", messages: &messages, tools: &tools, effort: Effort::Low, max_tokens: 100 };
+    let request = TurnRequest { system: "S", messages: &messages, tools: &tools, required_tool: None, effort: Effort::Low, max_tokens: 100 };
     for react in [false, true] {
         let reply = chat_sse(&[json!({"choices":[{"delta":{
             "content":r#"{"name":"look","arguments":{}}"#,
@@ -1465,7 +1507,7 @@ fn openrouter_with_no_provider_for_tools_falls_back_to_the_text_protocol() {
     use crate::model::{Effort, Msg, Stop, ToolDef, TurnRequest};
     let tools = [ToolDef { name: "look".into(), description: "Look at a file".into(), schema: json!({"type":"object"}) }];
     let messages = [Msg::user_text("hi")];
-    let request = TurnRequest { system: "S", messages: &messages, tools: &tools, effort: Effort::Low, max_tokens: 100 };
+    let request = TurnRequest { system: "S", messages: &messages, tools: &tools, required_tool: None, effort: Effort::Low, max_tokens: 100 };
     let none = json!({"error": {"code": 404, "message": "No endpoints found that can handle the requested parameters."}}).to_string();
     let reply = chat_sse(&[json!({"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]})]);
     let (url, seen) = mock(vec![(404, "application/json", none), (200, "text/event-stream", reply)]);
@@ -1485,7 +1527,7 @@ fn openrouter_with_no_provider_for_tools_falls_back_to_the_text_protocol() {
 fn openrouter_asks_again_for_an_answer_the_key_can_afford() {
     use crate::model::{Effort, Msg, Stop, TurnRequest};
     let messages = [Msg::user_text("hi")];
-    let request = TurnRequest { system: "S", messages: &messages, tools: &[], effort: Effort::Low, max_tokens: 100 };
+    let request = TurnRequest { system: "S", messages: &messages, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 100 };
     let refusal = |n: u64| {
         let message = format!(
             "This request requires more credits, or fewer max_tokens. You requested up to 131072 tokens, but can only afford {n}. To increase, visit https://openrouter.ai/settings/credits and add more credits"

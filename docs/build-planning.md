@@ -11,6 +11,12 @@ and save its phases, input inventory and acceptance criteria. It does not advanc
 implementation turn without a valid saved plan. This is a planning turn, not a request for the
 person to approve routine technical choices. Existing projects can gain a plan when resumed.
 
+If the builder ends its reply without saving, the handoff reports that the plan is still missing
+and allows at most two corrective turns with the current planning revision. Each correction asks
+for the actual save tool and its result. A failed save remains an error to correct; a written claim
+that the plan was saved does not count. The run stops incomplete if the plan is still missing,
+and provider failures or cancellation stop preparation immediately.
+
 The builder is instructed to preserve the original requested scope, use stable IDs when updating
 the plan, and include meaningful subpages, interactions, data changes and persistence where the
 request needs them. It must record missing evidence rather than infer a complete workflow from a
@@ -90,6 +96,14 @@ does not. Fabricated evidence IDs and unsupported check citations are rejected.
 and required readiness assessments. The default registry always includes planning; additional
 required extensions can be registered without replacing it. A failed required assessment blocks
 automatic completion and stops automatic refinement. Optional plugin checks are separate.
+
+Corrective API turns carry an optional named-tool requirement through the conversation interface.
+OpenAI-compatible native requests enforce it with `tool_choice`; text-protocol requests include it
+in their instructions. Anthropic retains automatic tool selection because current default models
+[reject forced tool choice](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools).
+The real successful tool result releases the requirement, including
+across an interrupted reply, and the host clears it before implementation. Every transport still
+has to satisfy the same saved-state check.
 
 Reused upstream check results still pass through the current required extension assessments.
 Changing the quality target, picture threshold, comparison widths or page limit invalidates the

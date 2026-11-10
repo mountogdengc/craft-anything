@@ -22,11 +22,17 @@ impl WorkflowExtension for PlanningExtension {
         INSTRUCTIONS
     }
     fn prepare(&self, ws: &Workspace) -> Result<Option<Preparation>, ToolError> {
-        Ok(load(ws)?.is_none().then(|| Preparation {
+        let state = engine_planning::load_project_state(&ws.investigation_dir())?;
+        Ok(state.plan.is_none().then(|| Preparation {
             progress: "Planning phases and needed inputs…".into(),
             prompt: PLAN_ONLY.into(),
             next_prompt: START_PHASE.into(),
             missing: MISSING_PLAN.into(),
+            correction: Some(format!(
+                "The build plan was not saved: Craft Anything checked the project's durable planning state after your reply and it still has no plan. A prose claim, simulated observation or provider checklist does not save it. Call core_build_plan_update with the complete plan and based_on_revision: {}. Wait for its real tool result; if it fails, correct the reported error and call it again. Include phases, inputs and acceptance with unresolved work still pending. Do not change application files or claim success before the tool confirms the save.",
+                state.revision
+            )),
+            correction_tool: Some("core_build_plan_update"),
         }))
     }
     fn assess(&self, ws: &Workspace, good_enough: f64) -> Result<Assessment, ToolError> {

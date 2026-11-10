@@ -212,6 +212,8 @@ pub struct TurnRequest<'a> {
     pub system: &'a str,
     pub messages: &'a [Msg],
     pub tools: &'a [ToolDef],
+    /// Named tool choice where supported. The host must check the real result/effects.
+    pub required_tool: Option<&'a str>,
     pub effort: Effort,
     pub max_tokens: u32,
 }

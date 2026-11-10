@@ -1,10 +1,24 @@
 # Status
 
 What works today and how it was checked. The plan, owners and order of work are in
-[ROADMAP.md](ROADMAP.md). Last updated 2026-11-09. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
+[ROADMAP.md](ROADMAP.md). Last updated 2026-11-10. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
 workspace clippy, layers, fmt and the secret scan of all history were clean. Chinese UI checks are listed separately below.
 
 ## What works, and how it was checked
+
+### Confirmed planning saves (R5.8)
+
+An unsaved planning reply receives at most two corrective turns with the current planning revision.
+OpenAI-compatible native requests require the save tool during correction; other transports keep
+their supported protocol. A real successful tool result releases that request, including across
+an interrupted reply. Implementation still requires a valid plan loaded from durable state.
+Local builders can read the planning revision as well as update the plan.
+
+Verified on Windows with 62 focused planning, agent-loop, OpenAI/Anthropic protocol and loopback
+tool-execution tests, including false save claims, rejected updates, bounded failure, unavailable
+tools and save-then-interruption recovery. Desktop/CLI debug builds, strict AI Clippy, formatting,
+layers, locks and the secret scan pass. An independent read-only review found no actionable issue. The full workspace suite and
+live provider calls were not run; the person's captured project was not modified for testing.
 
 ### Local Codex discovery and sign-in (R2.2)
 
