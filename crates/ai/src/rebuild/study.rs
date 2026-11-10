@@ -3,7 +3,80 @@
 
 use super::*;
 
+/// An Electron program is the Chromium and Node runtime, and analysing that takes hours: the app's
+/// own logic is the JavaScript in `resources/app.asar` beside it, which the study maps (#947).
+pub(super) fn is_electron_runtime(program: &Path) -> bool {
+    program.parent().is_some_and(|dir| dir.join("resources/app.asar").is_file())
+}
+
 impl Worker {
+    /// Follow-ups must recover a study skipped by an older run or disabled setting before
+    /// asking a builder to recreate the target. This runs in the host, through its own tools.
+    pub(super) fn ensure_native_observation(&mut self, ws: &mut Workspace, kind: &dyn TargetKind) -> Result<(), ToolError> {
+        self.stop.check()?;
+        let TargetRef::Local { path } = ws.manifest.target.clone() else { return Ok(()) };
+        if !kinds::runs::captured(ws).is_empty() {
+            return Ok(());
+        }
+        let (deep, runtime) = {
+            let session = self.engine.session();
+            (!session.clean_room(), session.settings.runtime_study)
+        };
+        // Only Deep mode may inspect a folder or executable header. Static package evidence can
+        // support implementation; the final comparison gate still decides readiness.
+        let program = if deep { locate(&path, kind.studies_folder()).0 } else { path };
+        if deep && !is_program(&program) {
+            return Ok(());
+        }
+        if deep && kinds::runs::is_console(&program) {
+            if runtime {
+                std::fs::create_dir_all(ws.capture_dir()).map_err(|e| ToolError::io(ws.capture_dir().display(), e))?;
+                if let Some(notes) = self.capture_runs(&program, &ws.capture_dir())? {
+                    self.append_observation_notes(ws, &notes)?;
+                }
+            }
+            // Console output has its own comparison path; it does not require a GUI picture.
+            return Ok(());
+        }
+        let tree = captured_ui(&ws.capture_dir());
+        let knows_window_state = tree
+            .as_ref()
+            .and_then(|t| t.get("nodes"))
+            .and_then(Value::as_array)
+            .is_some_and(|nodes| nodes.iter().any(|n| n.get("modal").is_some_and(Value::is_boolean)));
+        if runtime
+            && is_program(&program)
+            && (!readable_picture(&ws.capture_dir().join("window.png")) || has_blocking_dialog(&ws.capture_dir()) || (cfg!(windows) && !knows_window_state))
+        {
+            std::fs::create_dir_all(ws.capture_dir()).map_err(|e| ToolError::io(ws.capture_dir().display(), e))?;
+            let notes = self.picture_window(ws, &program, &ws.capture_dir())?;
+            // Preserve the earlier static study, if any, and tell a resumed builder about the
+            // new capture explicitly in its next prompt.
+            self.append_observation_notes(ws, &notes)?;
+        }
+        if ws.references().iter().any(|p| readable_picture(p)) {
+            return Ok(());
+        }
+        if has_blocking_dialog(&ws.capture_dir()) {
+            return Err(blocking_dialog_error());
+        }
+        if readable_picture(&ws.capture_dir().join("window.png")) || ws.references().iter().any(|p| readable_picture(p)) {
+            return Ok(());
+        }
+        Err(ToolError::new(
+            ErrorCode::NotFound,
+            "The original has not been observed. There is no usable window capture or reference picture to recreate it from.",
+        )
+        .with_remediation("Enable Run to study and choose the original executable, then try again, or add screenshots of the original."))
+    }
+
+    fn append_observation_notes(&self, ws: &Workspace, notes: &str) -> Result<(), ToolError> {
+        let file = ws.capture_dir().join("README.md");
+        let mut previous = std::fs::read_to_string(&file).unwrap_or_default();
+        previous.push_str(notes);
+        craft_anything_engine::project::write_atomic(&file, previous.as_bytes())
+    }
+
     pub(super) fn study(&mut self, ws: &mut Workspace, kind: &dyn TargetKind) -> Result<(), ToolError> {
         match ws.manifest.target.clone() {
             TargetRef::Website { url } => {
@@ -86,8 +159,14 @@ impl Worker {
                     }
                     notes.push_str(&inventory(&f));
                 }
-                let is_js = path.extension().is_some_and(|e| e == "asar") || path.join("resources/app.asar").exists() || path.join("package.json").exists();
-                if is_js && let Ok(out) = self.call("js_app_map", json!({"input_path": path.display().to_string(), "limit": 50})) {
+                // A program's app.asar or package.json sits beside it, so look in its folder too.
+                let js_root = if program.is_file() { program.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) } else { None };
+                let packaged = |root: &Path| root.join("resources/app.asar").exists() || root.join("package.json").exists();
+                let js_input =
+                    if path.extension().is_some_and(|e| e == "asar") || packaged(&path) { Some(path.clone()) } else { js_root.filter(|r| packaged(r)) };
+                if let Some(input) = js_input
+                    && let Ok(out) = self.call("js_app_map", json!({"input_path": input.display().to_string(), "limit": 50}))
+                {
                     notes.push_str("\n## JavaScript application\n\n");
                     notes.push_str(&describe(&out));
                 }
@@ -160,20 +239,65 @@ impl Worker {
     /// Runtime study (Settings): start the program once and picture its window into capture/, for
     /// the notes.
     fn picture_window(&mut self, ws: &mut Workspace, program: &Path, capture: &Path) -> Result<String, ToolError> {
-        self.step(ws, Step::Study, Status::Inspecting, "Starting it for a moment to picture its window…")?;
+        match self.capture_window(ws, program, capture) {
+            Ok(notes) => Ok(notes),
+            Err(e) if e.code == ErrorCode::Cancelled => Err(e),
+            Err(e) if ws.references().iter().any(|p| readable_picture(p)) => {
+                self.stop.check()?;
+                // A partial capture or startup dialog must not masquerade as the working app.
+                for file in [capture.join("window.png"), capture.join("ui-tree.json")] {
+                    match std::fs::remove_file(&file) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(ToolError::io(file.display(), e)),
+                    }
+                }
+                Ok(format!(
+                    "\n## Runtime observation unavailable\n\n{} Continue from the supplied reference pictures in reference/. Runtime behavior has not been observed; record the missing workflows as unknowns.\n",
+                    e.message
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn capture_window(&mut self, ws: &mut Workspace, program: &Path, capture: &Path) -> Result<String, ToolError> {
+        self.step(ws, Step::Study, Status::Inspecting, "Observing the original's window…")?;
         let shot = capture.join("window.png");
         let tree = capture.join("ui-tree.json");
-        let params =
-            json!({"program": program.display().to_string(), "wait_secs": 15, "output": shot.display().to_string(), "ui_tree": tree.display().to_string()});
-        let picture = "capture/window.png is a picture of its window 15 seconds after it started. Open it with the Read tool: match its layout, colours and proportions.\n";
+        for file in [&shot, &tree] {
+            match std::fs::remove_file(file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ToolError::io(file.display(), e)),
+            }
+        }
+        let params = json!({"program": program.display().to_string(), "reuse_running": cfg!(windows), "wait_secs": 15, "output": shot.display().to_string(), "ui_tree": tree.display().to_string()});
+        let picture = "capture/window.png records the original's visible window. Open it with the Read tool and study its layout, colours and proportions.\n";
         let mut notes = String::from("\n## How it looks running\n\n");
-        notes.push_str(&match self.call("native_window_capture", params) {
-            Ok(_) if tree.is_file() => format!(
+        self.call("native_window_capture", params).map_err(|e| {
+            if e.code == ErrorCode::Cancelled {
+                e
+            } else {
+                ToolError::new(e.code, format!("Could not observe the original: {}", e.message))
+                    .with_remediation("Check that the original opens on this computer, then try again. You can also add screenshots of its working interface.")
+            }
+        })?;
+        if !readable_picture(&shot) {
+            return Err(ToolError::new(ErrorCode::GarbledOutput, "The original's window capture is missing, unreadable or blank.")
+                .with_remediation("Open the original and check that it draws its interface, then try again or add screenshots."));
+        }
+        if has_blocking_dialog(capture) {
+            return Err(blocking_dialog_error());
+        }
+        notes.push_str(&if tree.is_file() {
+            format!(
                 "{picture}capture/ui-tree.json lists the controls in its windows at that moment, in order (role, title, identifier, value, position and size in pixels): use it for the names, order and placement of its menus, buttons and fields.\n"
-            ),
-            Ok(_) => picture.to_string(),
-            Err(e) => format!("Starting it for a picture didn't work ({}), so there's no picture of it running.\n", e.message),
+            )
+        } else {
+            picture.to_string()
         });
+        notes.push_str("This captures one visible state. Check whether a startup, license or login dialog obscures the working interface. Record missing workflows as unknowns; one picture does not establish matching behavior.\n");
         Ok(notes)
     }
 
@@ -232,7 +356,7 @@ impl Worker {
     /// rather than starting another), and it carries on if the person pauses, so nothing is lost.
     pub(super) fn prepare_ghidra(&self, program: &Path) -> Option<Receiver<Result<(), String>>> {
         // A folder (nothing in it recognised as the program) isn't something Ghidra can open.
-        if !program.is_file() {
+        if !program.is_file() || is_electron_runtime(program) {
             return None;
         }
         let settings = {
@@ -244,12 +368,22 @@ impl Worker {
         };
         let program = program.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (feed, events, wake) = (self.feed.clone(), self.tx.clone(), self.wake.clone());
         std::thread::Builder::new()
             .name("ghidra-prepare".into())
             .spawn(move || {
                 let result = std::fs::read(&program).map_err(|e| e.to_string()).and_then(|bytes| {
                     let sha = craft_anything_evidence::sha256_hex(&bytes);
-                    craft_anything_engine::tools::deep::prepare(&settings, &bytes, &sha, &|_| {})
+                    // Said in the feed (once per change), so a wait for an earlier analysis shows.
+                    let last = Mutex::new(String::new());
+                    let said = |m: &str| {
+                        let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+                        if *last != m {
+                            *last = m.to_string();
+                            emit_event(&feed, &events, &wake, RunEvent::Step { step: Step::Study, text: m.to_string() });
+                        }
+                    };
+                    craft_anything_engine::tools::deep::prepare(&settings, &bytes, &sha, &said)
                 });
                 if let Err(e) = &result {
                     log::warn!("Ghidra's analysis of {} failed: {e}", program.display());
@@ -259,6 +393,41 @@ impl Worker {
             .ok()?;
         Some(rx)
     }
+}
+
+pub(super) fn has_blocking_dialog(capture: &Path) -> bool {
+    captured_ui(capture)
+        .as_ref()
+        .and_then(|t| t.get("nodes"))
+        .and_then(Value::as_array)
+        .is_some_and(|nodes| nodes.iter().any(|node| node.get("modal").and_then(Value::as_bool) == Some(true)))
+}
+
+fn captured_ui(capture: &Path) -> Option<Value> {
+    use std::io::Read;
+    std::fs::File::open(capture.join("ui-tree.json")).ok().and_then(|file| serde_json::from_reader(file.take(16 * 1024 * 1024)).ok())
+}
+
+fn blocking_dialog_error() -> ToolError {
+    ToolError::new(ErrorCode::NotFound, "A modal dialog is blocking observation of the original's working interface.").with_remediation(
+        "Open the original, dismiss its startup dialog and leave the editor open, then try again. On Windows, Run to study reuses that open editor.",
+    )
+}
+
+/// Bound reads of user-supplied evidence and reject an empty or corrupt image as observation.
+pub(super) fn readable_picture(path: &Path) -> bool {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    let read = || -> Option<Vec<u8>> {
+        let file = std::fs::File::open(path).ok()?;
+        if file.metadata().ok()?.len() > MAX_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() as u64 <= MAX_BYTES).then_some(bytes)
+    };
+    read().and_then(|bytes| craft_anything_engine::tools::web_common::decode_picture(&bytes).ok()).is_some_and(|img| !kinds::screenshot::is_blank(&img))
 }
 
 /// Deep mode's notes on how a website works, in capture/.

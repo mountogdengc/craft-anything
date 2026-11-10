@@ -133,6 +133,7 @@ pub fn all() -> Vec<crate::ToolSpec> {
     v.extend(web_runtime_tools::specs());
     v.extend(application_tools::specs());
     v.extend(investigation_tools::specs());
+    v.extend(crate::extensions::specs());
     v.extend(report_tools::specs());
     v.extend(native_listing::specs());
     v.extend(native_function::specs());

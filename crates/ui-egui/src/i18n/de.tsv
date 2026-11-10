@@ -1467,3 +1467,21 @@ About "{question}":	Zu „{question}“:
 The project plan could not be read.	Der Projektplan konnte nicht gelesen werden.
 Update the build plan	Build-Plan aktualisieren
 Keep the project phases, missing information and checks together in one plan.	Halte die Projektphasen, fehlenden Angaben und Prüfungen in einem Plan fest.
+Choose what the builder's approvals get	Festlegen, was die Freigaben des Builders erhalten
+Reading the web	Im Web lesen
+Other commands	Andere Befehle
+Files outside the project	Dateien außerhalb des Projekts
+Pushing and publishing	Pushen und Veröffentlichen
+Deleting outside the project	Löschen außerhalb des Projekts
+System changes	Systemänderungen
+Other tools	Andere Werkzeuge
+Allow	Erlauben
+Ask	Fragen
+Refuse	Ablehnen
+After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	Tippe nach /approvals eine Art und allow, ask, refuse oder default, zum Beispiel /approvals publish ask. Arten: {kinds}.
+There's no kind called {name}. Kinds: {kinds}.	Es gibt keine Art namens {name}. Arten: {kinds}.
+Approvals	Freigaben
+In this project, {kind}: {choice}.	In diesem Projekt {kind}: {choice}.
+Couldn't change the approvals:	Die Freigaben konnten nicht geändert werden:
+What the builder may do without asking you, in this project.	Was der Builder in diesem Projekt tun darf, ohne dich zu fragen.
+Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	Standard folgt dem Automatikmodus: Ist er an, geschieht, was sich rückgängig machen lässt, und der Rest wird abgelehnt; ist er aus, fragt der Builder.

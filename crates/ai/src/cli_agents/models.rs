@@ -81,6 +81,9 @@ pub(crate) fn parse_models(bytes: &[u8]) -> Result<Vec<AgentModel>, ToolError> {
 }
 
 /// Only connection flags belong on both `api` and `run`; prompt/run flags never leak into discovery.
+/// Without a server the person chose, discovery asks a private server (`--standalone`), as runs do:
+/// plain `api` starts OpenCode's shared service, which resumes every unfinished session on the
+/// computer, in any project, and carries on with its commands (#1115).
 fn connection_args(options: &BackendOptions) -> Result<Vec<String>, ToolError> {
     let mut result = Vec::new();
     let mut args = options.args.iter();
@@ -92,6 +95,9 @@ fn connection_args(options: &BackendOptions) -> Result<Vec<String>, ToolError> {
                 args.next().filter(|s| !s.is_empty() && !s.starts_with('-')).ok_or_else(|| ToolError::invalid("OpenCode's --server needs an address."))?;
             result.extend([arg.clone(), server.clone()]);
         }
+    }
+    if result.is_empty() {
+        result.push("--standalone".into());
     }
     Ok(result)
 }
@@ -106,7 +112,7 @@ pub(crate) fn query_args(options: &BackendOptions) -> Result<Vec<String>, ToolEr
 /// Select the configured executable and catalogue location, quoting SSH arguments for the remote shell.
 /// Local queries use the supplied directory or current directory; SSH queries expand remote `$PWD`.
 fn query_command(config: &BackendConfig, options: &BackendOptions, directory: Option<&Path>) -> Result<(String, Vec<String>), ToolError> {
-    let program = super::program_of(config, options);
+    let program = super::program_of(config, options)?;
     let mut args = query_args(options)?;
     match config.ssh_host.as_deref().filter(|h| !h.trim().is_empty()) {
         Some(host) => {
@@ -277,9 +283,16 @@ mod tests {
             args.last().unwrap(),
             "'/opt/agent'\\''s tools/opencode' api model.list --server http://localhost:4096 --param \"location[directory]=$PWD\""
         );
+        // Locally a chosen path must exist: a missing one falls back to an installed `opencode`.
         cfg.ssh_host = None;
+        let folder = tempfile::tempdir().unwrap();
+        let chosen = folder.path().join("agent's tools").join("opencode");
+        std::fs::create_dir_all(chosen.parent().unwrap()).unwrap();
+        std::fs::write(&chosen, b"").unwrap();
+        let chosen = chosen.display().to_string();
+        let options = BackendOptions { command: Some(chosen.clone()), ..options };
         let (program, args) = query_command(&cfg, &options, Some(Path::new("/work/test"))).unwrap();
-        assert_eq!(program, "/opt/agent's tools/opencode");
+        assert_eq!(program, chosen);
         assert_eq!(args, ["api", "model.list", "--server", "http://localhost:4096", "--param", "location[directory]=/work/test"]);
     }
 
@@ -299,7 +312,24 @@ mod tests {
         let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
         let (_, args) = query_command(&cfg, &options, Some(Path::new("/local/ignored"))).unwrap();
         let output = Process::new("sh").arg("-c").arg(args.last().unwrap()).cwd(&remote).timeout(Duration::from_secs(2)).run_checked().unwrap();
-        assert_eq!(output.stdout_text().lines().collect::<Vec<_>>(), ["api", "model.list", "--param", &format!("location[directory]={}", remote.display())]);
+        // The shell resolves aliases in its working directory (macOS /var points to /private/var).
+        let remote = remote.canonicalize().unwrap();
+        assert_eq!(
+            output.stdout_text().lines().collect::<Vec<_>>(),
+            ["api", "model.list", "--standalone", "--param", &format!("location[directory]={}", remote.display())]
+        );
+    }
+
+    /// #1115: plain `api` starts OpenCode's shared service, which resumes unfinished sessions in other
+    /// projects. Discovery uses a private server unless the person chose one, and never adds it twice.
+    #[test]
+    fn discovery_never_starts_the_shared_service() {
+        let with = |args: &[&str]| query_args(&BackendOptions { args: args.iter().map(|a| a.to_string()).collect(), ..Default::default() }).unwrap();
+        assert_eq!(with(&[]), ["api", "model.list", "--standalone"]);
+        assert_eq!(with(&["--agent", "build"]), ["api", "model.list", "--standalone"], "run-only flags don't count as a choice");
+        assert_eq!(with(&["--standalone"]), ["api", "model.list", "--standalone"]);
+        assert_eq!(with(&["--server", "http://localhost:4096"]), ["api", "model.list", "--server", "http://localhost:4096"]);
+        assert_eq!(with(&["--server=http://localhost:4096"]), ["api", "model.list", "--server=http://localhost:4096"]);
     }
 
     /// A local CLI stand-in verifies project-specific discovery, malformed output, exit errors and deadlines.

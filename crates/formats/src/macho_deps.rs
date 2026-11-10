@@ -5,7 +5,7 @@
 
 use crate::FormatError;
 use crate::bytes::Reader;
-use crate::macho::{cpu_name, fat_slices, load_command_name};
+use crate::macho::{cpu_name, fat_slices, load_command_min_size, load_command_name};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
 
@@ -54,6 +54,8 @@ pub struct Encryption {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SectionRef {
+    /// The low byte of the section flags describes its storage type.
+    pub section_type: u8,
     pub segname: String,
     pub sectname: String,
     pub addr: u64,
@@ -331,18 +333,35 @@ pub fn parse_thin(data: &[u8]) -> Result<MachoDeps, FormatError> {
         out.warnings.push(format!("{ncmds} load commands; reading the first {MAX_CMDS}"));
     }
     for index in 0..ncmds.min(MAX_CMDS) {
+        if pos.checked_add(8).is_none_or(|end| end > limit) {
+            out.warnings.push(format!("load command {index} header runs past sizeofcmds; stopped"));
+            break;
+        }
         let (Some(cmd), Some(size)) = (e.u32(pos), e.u32(pos + 4)) else {
             out.warnings.push(format!("load command {index} is cut short"));
             break;
         };
         let sz = size as usize;
-        if sz < 8 || pos.saturating_add(sz) > data.len() {
+        if sz < 8 {
             out.warnings.push(format!("load command {index} has a bad size {size}; stopped"));
             break;
         }
+        let Some(end) = pos.checked_add(sz).filter(|&end| end <= limit) else {
+            out.warnings.push(format!("load command {index} runs past sizeofcmds; stopped"));
+            break;
+        };
+        let name = extra_name(cmd);
+        let minimum = load_command_min_size(cmd);
+        if sz < minimum {
+            out.warnings.push(format!("load command {index} ({name}) needs at least {minimum} bytes; skipped its fields"));
+            out.commands.push(LoadCommand { index, cmd: name, offset: pos, size, detail: json!({"error": "fixed command fields are cut short"}) });
+            pos = end;
+            continue;
+        }
+        let e = E { r: Reader::new(data.get(..end).unwrap_or(&[])), be };
         let str_at = |field: usize| -> Option<String> {
             let o = e.u32(pos + field)? as usize;
-            if o < 8 || o >= sz {
+            if o < minimum || o >= sz {
                 return None;
             }
             e.r.cstr(pos + o, sz - o)
@@ -355,7 +374,6 @@ pub fn parse_thin(data: &[u8]) -> Result<MachoDeps, FormatError> {
                 compatibility_version: version(e.u32(pos + 20).unwrap_or(0)),
             })
         };
-        let name = extra_name(cmd);
         let detail = match cmd {
             0xc | 0x20 | 0x8000_0018 | 0x8000_001f | 0x8000_0023 => {
                 let kind = match cmd {
@@ -415,7 +433,11 @@ pub fn parse_thin(data: &[u8]) -> Result<MachoDeps, FormatError> {
             }
             0x32 => {
                 let ntools = e.u32(pos + 20).unwrap_or(0) as usize;
-                let tools: Vec<String> = (0..ntools.min(32))
+                let complete = (sz - 24) / 8;
+                if ntools > complete {
+                    out.warnings.push(format!("load command {index} build tools are cut short"));
+                }
+                let tools: Vec<String> = (0..ntools.min(32).min(complete))
                     .filter_map(|i| {
                         let t = e.u32(pos + 24 + i * 8)?;
                         let v = e.u32(pos + 28 + i * 8)?;
@@ -497,9 +519,13 @@ pub fn parse_thin(data: &[u8]) -> Result<MachoDeps, FormatError> {
                 let initprot = e.u32(pos + prot_o).unwrap_or(0);
                 let nsects = e.u32(pos + ns_o).unwrap_or(0) as usize;
                 let mut names = Vec::new();
-                for i in 0..nsects.min(256) {
+                let complete = (sz - sh) / shsize;
+                if nsects > complete {
+                    out.warnings.push(format!("load command {index} section headers are cut short"));
+                }
+                for i in 0..nsects.min(256).min(complete) {
                     let o = pos + sh + i * shsize;
-                    if o + shsize > pos + sz || out.sections.len() >= MAX_SECTIONS {
+                    if out.sections.len() >= MAX_SECTIONS {
                         break;
                     }
                     let (addr, size, offset) = if wide {
@@ -508,6 +534,7 @@ pub fn parse_thin(data: &[u8]) -> Result<MachoDeps, FormatError> {
                         (e.u32(o + 32).map(u64::from), e.u32(o + 36).map(u64::from), e.u32(o + 40))
                     };
                     let s = SectionRef {
+                        section_type: (e.u32(o + if wide { 64 } else { 56 }).unwrap_or(0) & 0xff) as u8,
                         segname: e.r.cstr(o + 16, 16).unwrap_or_default(),
                         sectname: e.r.cstr(o, 16).unwrap_or_default(),
                         addr: addr.unwrap_or(0),
@@ -529,13 +556,7 @@ pub fn parse_thin(data: &[u8]) -> Result<MachoDeps, FormatError> {
             _ => Json::Null,
         };
         out.commands.push(LoadCommand { index, cmd: name, offset: pos, size, detail });
-        pos = match pos.checked_add(sz) {
-            Some(p) => p,
-            None => break,
-        };
-    }
-    if pos > limit {
-        out.warnings.push("load commands run past sizeofcmds".into());
+        pos = end;
     }
     Ok(out)
 }
@@ -544,6 +565,11 @@ impl MachoDeps {
     /// The file bytes of a section, by segment and section name.
     pub fn section_bytes<'a>(&self, data: &'a [u8], seg: &str, sect: &str) -> Option<&'a [u8]> {
         let s = self.sections.iter().find(|s| s.segname == seg && s.sectname == sect)?;
+        // S_ZEROFILL, S_GB_ZEROFILL and S_THREAD_LOCAL_ZEROFILL have
+        // virtual storage but no corresponding range in the file.
+        if matches!(s.section_type, 0x1 | 0xc | 0x12) {
+            return None;
+        }
         let off = s.offset as usize;
         data.get(off..off.checked_add(usize::try_from(s.size).ok()?)?)
     }
@@ -553,6 +579,19 @@ impl MachoDeps {
 mod tests {
     use super::*;
     use craft_anything_testkit::apple as fx;
+
+    #[test]
+    fn zero_fill_sections_have_no_bytes_in_the_file() {
+        for flags in [0x1_u32, 0xc, 0x12] {
+            let mut image = fx::macho_min(fx::CPU_ARM64, 2, &[], &[("__bss", b"data")]);
+            // 64-bit Mach header, segment command, then the first section.
+            let section = 32 + 72;
+            image[section + 48..section + 52].copy_from_slice(&0_u32.to_le_bytes());
+            image[section + 64..section + 68].copy_from_slice(&flags.to_le_bytes());
+            let layout = parse_thin(&image).unwrap();
+            assert_eq!(layout.section_bytes(&image, "__TEXT", "__bss"), None);
+        }
+    }
 
     #[test]
     fn reads_load_commands() {

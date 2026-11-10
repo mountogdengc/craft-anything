@@ -14,17 +14,6 @@
       ],
       "default": null
     },
-    "build_plan": {
-      "description": "Canonical project scope and progress. The older plan remains an analysis checklist.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/BuildPlan"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "findings": {
       "type": "array",
       "default": [],
@@ -76,65 +65,6 @@
     "revision"
   ],
   "$defs": {
-    "AcceptanceCriterion": {
-      "type": "object",
-      "properties": {
-        "checks": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/CheckReference"
-          }
-        },
-        "description": {
-          "type": "string"
-        },
-        "evidence_ids": {
-          "description": "Observed or derived evidence that demonstrates this outcome in the built project.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "id": {
-          "type": "string"
-        },
-        "phase_id": {
-          "type": "string"
-        },
-        "required": {
-          "type": "boolean",
-          "default": true
-        },
-        "status": {
-          "$ref": "#/$defs/AcceptanceStatus",
-          "default": "pending"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "phase_id",
-        "description"
-      ]
-    },
-    "AcceptanceStatus": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "pending",
-            "implemented"
-          ]
-        },
-        {
-          "description": "The agent has recorded supporting evidence or check results, validated when saved.",
-          "type": "string",
-          "const": "verified"
-        }
-      ]
-    },
     "Brief": {
       "type": "object",
       "properties": {
@@ -170,158 +100,6 @@
       },
       "required": [
         "question"
-      ]
-    },
-    "BuildInput": {
-      "type": "object",
-      "properties": {
-        "evidence_ids": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "format": {
-          "description": "What the person can supply, such as a choice, a screenshot or a sample file.",
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "phase_ids": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "question": {
-          "type": "string"
-        },
-        "required": {
-          "type": "boolean",
-          "default": true
-        },
-        "response": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "status": {
-          "$ref": "#/$defs/InputStatus",
-          "default": "needed"
-        },
-        "why": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "question",
-        "why",
-        "format",
-        "phase_ids"
-      ]
-    },
-    "BuildPhase": {
-      "type": "object",
-      "properties": {
-        "depends_on": {
-          "description": "Stable ids of phases whose implementation this phase needs.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "goal": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "status": {
-          "$ref": "#/$defs/PhaseStatus",
-          "default": "todo"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "title",
-        "goal"
-      ]
-    },
-    "BuildPlan": {
-      "type": "object",
-      "properties": {
-        "acceptance": {
-          "description": "Concrete outcomes to check, including interactions and persistence where requested.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/AcceptanceCriterion"
-          }
-        },
-        "goal": {
-          "description": "The requested outcome. Keep the person's scope when revising the plan.",
-          "type": "string"
-        },
-        "inputs": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/BuildInput"
-          }
-        },
-        "phases": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/BuildPhase"
-          }
-        },
-        "version": {
-          "type": "integer",
-          "format": "uint32",
-          "default": 1,
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "goal",
-        "phases",
-        "acceptance"
-      ]
-    },
-    "CheckReference": {
-      "type": "object",
-      "properties": {
-        "check": {
-          "description": "A check id actually recorded in craft.json, not a command or a proposed test.",
-          "type": "string"
-        },
-        "claim": {
-          "description": "If present, the exact title of a passing claim within that check.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "round": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "check",
-        "round"
       ]
     },
     "ConfidenceParam": {
@@ -411,32 +189,6 @@
         "supported",
         "refuted",
         "abandoned"
-      ]
-    },
-    "InputStatus": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "needed",
-            "requested",
-            "provided"
-          ]
-        },
-        {
-          "description": "Still unavailable. Deferring a required input does not resolve its blocker.",
-          "type": "string",
-          "const": "deferred"
-        }
-      ]
-    },
-    "PhaseStatus": {
-      "type": "string",
-      "enum": [
-        "todo",
-        "doing",
-        "done",
-        "blocked"
       ]
     },
     "PlanStep": {

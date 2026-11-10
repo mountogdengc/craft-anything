@@ -91,6 +91,7 @@ struct MSegment {
     name: String,
     vmaddr: u64,
     fileoff: u64,
+    filesize: u64,
 }
 
 pub fn load_command_name(cmd: u32) -> String {
@@ -128,24 +129,49 @@ pub fn load_command_name(cmd: u32) -> String {
     .into()
 }
 
-fn platform_name(p: u32) -> &'static str {
-    match p {
-        1 => "macos",
-        2 => "ios",
-        3 => "tvos",
-        4 => "watchos",
-        5 => "bridgeos",
-        6 => "mac-catalyst",
-        7 => "ios-simulator",
-        8 => "tvos-simulator",
-        9 => "watchos-simulator",
-        11 => "visionos",
-        _ => "unknown",
+/// Fixed bytes required before decoding a known load command's fields.
+pub(crate) fn load_command_min_size(cmd: u32) -> usize {
+    match cmd {
+        0x1 => 56,
+        0x2 | 0x1b | 0x2c | 0x32 | 0x8000_0028 => 24,
+        0x5 => 16,
+        0xb => 80,
+        0xc | 0xd | 0x20 | 0x8000_0018 | 0x8000_001f | 0x8000_0023 => 24,
+        0xe | 0xf | 0x12 | 0x13 | 0x14 | 0x15 | 0x27 | 0x8000_001c => 12,
+        0x19 => 72,
+        0x1d | 0x1e | 0x24 | 0x25 | 0x26 | 0x29 | 0x2a | 0x2b | 0x2e | 0x2f | 0x30 | 0x8000_0033 | 0x8000_0034 => 16,
+        0x21 => 20,
+        0x22 | 0x8000_0022 => 48,
+        _ => 8,
     }
 }
 
 fn nibble_version(v: u32) -> String {
     format!("{}.{}.{}", v >> 16, (v >> 8) & 0xff, v & 0xff)
+}
+
+// A thread command can carry several flavor/count/state records. Counts are 32-bit words.
+fn unixthread_pc(data: &[u8], cpu: u32, is64: bool) -> Option<u64> {
+    let r = Reader::new(data);
+    let mut pos = 0usize;
+    for _ in 0..MAX_CMDS {
+        let flavor = r.u32_le(pos)?;
+        let count = r.u32_le(pos.checked_add(4)?)?;
+        let state = pos.checked_add(8)?;
+        let size = usize::try_from(count).ok()?.checked_mul(4)?;
+        let record = Reader::new(r.slice(state, size)?);
+        let pc = match (cpu, is64, flavor) {
+            (0x0100_0007, true, 4) if count >= 42 => record.u64_le(16 * 8),
+            (0x0100_000c, true, 6) if count >= 68 => record.u64_le(32 * 8),
+            (7, false, 1) if count >= 16 => record.u32_le(10 * 4).map(u64::from),
+            _ => None,
+        };
+        if pc.is_some() {
+            return pc;
+        }
+        pos = state.checked_add(size)?;
+    }
+    None
 }
 
 /// Add Mach-O facts. `data` is the (thin) slice.
@@ -161,8 +187,13 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
         return;
     }
     let ncmds = r.u32_le(16).unwrap_or(0) as usize;
+    let sizeofcmds = r.u32_le(20).unwrap_or(0) as usize;
     let header_flags = r.u32_le(24).unwrap_or(0);
-    let mut pos = if is64 { 32 } else { 28 };
+    let mut pos: usize = if is64 { 32 } else { 28 };
+    let limit = pos.saturating_add(sizeofcmds).min(data.len());
+    if sizeofcmds > data.len().saturating_sub(pos) {
+        b.warnings.push("sizeofcmds runs past the end of the file".into());
+    }
     let mut sections = Vec::new();
     let mut segments = Vec::new();
     let mut symtab = None;
@@ -173,6 +204,10 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
     let mut cmds_json = Vec::new();
     let mut libs = Vec::new();
     for _ in 0..ncmds.min(MAX_CMDS) {
+        if pos.checked_add(8).is_none_or(|end| end > limit) {
+            b.warnings.push("load command header runs past sizeofcmds; stopped".into());
+            break;
+        }
         let (Some(cmd), Some(size)) = (r.u32_le(pos), r.u32_le(pos + 4)) else {
             b.warnings.push("load commands cut short".into());
             break;
@@ -182,12 +217,23 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             b.warnings.push("a load command has a size below 8; stopped".into());
             break;
         }
+        let Some(end) = pos.checked_add(size).filter(|&end| end <= limit) else {
+            b.warnings.push("a load command runs past sizeofcmds; stopped".into());
+            break;
+        };
         if cmds_json.len() < 512 {
             cmds_json.push(json!({"cmd": load_command_name(cmd), "size": size}));
         }
+        let minimum = load_command_min_size(cmd);
+        if size < minimum {
+            b.warnings.push(format!("{} needs at least {minimum} bytes; skipped its fields", load_command_name(cmd)));
+            pos = end;
+            continue;
+        }
+        let r = Reader::new(data.get(..end).unwrap_or(&[]));
         let str_at = |field: usize| -> Option<String> {
             let o = r.u32_le(pos + field)? as usize;
-            if o >= size {
+            if o < minimum || o >= size {
                 return None;
             }
             r.cstr(pos + o, size - o)
@@ -198,13 +244,15 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
                 let name = r.cstr(pos + name_o, 16).unwrap_or_default();
                 let vmaddr = if cmd == 0x19 { r.u64_le(pos + vm) } else { r.u32_le(pos + vm).map(u64::from) }.unwrap_or(0);
                 let fileoff = if cmd == 0x19 { r.u64_le(pos + fo) } else { r.u32_le(pos + fo).map(u64::from) }.unwrap_or(0);
-                segments.push(MSegment { name, vmaddr, fileoff });
+                let filesize = if cmd == 0x19 { r.u64_le(pos + fo + 8) } else { r.u32_le(pos + fo + 4).map(u64::from) }.unwrap_or(0);
+                segments.push(MSegment { name, vmaddr, fileoff, filesize });
                 let nsects = r.u32_le(pos + ns).unwrap_or(0) as usize;
-                for i in 0..nsects.min(256) {
+                let complete = (size - sh) / shsize;
+                if nsects > complete {
+                    b.warnings.push("segment section headers run past the load command; reading complete headers".into());
+                }
+                for i in 0..nsects.min(256).min(complete) {
                     let o = pos + sh + i * shsize;
-                    if o + shsize > pos + size {
-                        break;
-                    }
                     let (addr, sz, flags_o) = if cmd == 0x19 {
                         (r.u64_le(o + 32), r.u64_le(o + 40), 64)
                     } else {
@@ -254,20 +302,14 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             }
             0x8000_0028 => entryoff = r.u64_le(pos + 8),
             0x5 => {
-                // flavor, count, state…
-                let state = pos + 16;
-                thread_pc = match r.u32_le(pos + 8) {
-                    Some(4) => r.u64_le(state + 16 * 8),                         // x86_THREAD_STATE64: rip
-                    Some(6) => r.u64_le(state + 32 * 8),                         // ARM_THREAD_STATE64: pc
-                    Some(1) if !is64 => r.u32_le(state + 10 * 4).map(u64::from), // i386: eip
-                    _ => None,
-                };
+                thread_pc = thread_pc.or_else(|| unixthread_pc(data.get(pos + 8..end)?, r.u32_le(4)?, is64));
             }
             0x26 => fstarts = Some((r.u32_le(pos + 8).unwrap_or(0), r.u32_le(pos + 12).unwrap_or(0))),
             0x1d => b.mitigations.code_signature = Some(true),
             0x21 | 0x2c => b.mitigations.encrypted = Some(r.u32_le(pos + 16).unwrap_or(0) != 0),
             0x32 => {
-                b.info.insert("platform".into(), platform_name(r.u32_le(pos + 8).unwrap_or(0)).into());
+                // One platform table for the binary and the dependency views.
+                b.info.insert("platform".into(), crate::macho_deps::platform_name(r.u32_le(pos + 8).unwrap_or(0)));
                 b.info.insert("min_os".into(), nibble_version(r.u32_le(pos + 12).unwrap_or(0)));
                 b.info.insert("sdk".into(), nibble_version(r.u32_le(pos + 16).unwrap_or(0)));
             }
@@ -283,10 +325,7 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             }
             _ => {}
         }
-        pos = match pos.checked_add(size) {
-            Some(p) => p,
-            None => break,
-        };
+        pos = end;
     }
     b.libraries = libs;
     if b.mitigations.code_signature.is_none() {
@@ -295,10 +334,11 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
     b.mitigations.pie = Some(header_flags & 0x0020_0000 != 0);
     b.mitigations.nx = Some(header_flags & 0x0002_0000 == 0);
     let text = segments.iter().find(|s| s.name == "__TEXT").cloned();
-    // Entry point.
+    // Entry point. LC_MAIN gives a file offset: map it through the segment whose file bytes hold
+    // it. Segments with no file bytes (__PAGEZERO, a __DATA of only zero-fill sections) usually
+    // record file offset 0, like __TEXT, and must not claim it.
     if let Some(off) = entryoff {
-        let seg = segments.iter().filter(|s| s.fileoff <= off && s.name != "__PAGEZERO").max_by_key(|s| s.fileoff);
-        b.entry = seg.map(|s| s.vmaddr.wrapping_add(off - s.fileoff));
+        b.entry = segments.iter().find_map(|s| off.checked_sub(s.fileoff).filter(|&d| d < s.filesize).map(|d| s.vmaddr.wrapping_add(d)));
     } else if let Some(pc) = thread_pc {
         b.entry = Some(pc);
     } else {
@@ -309,15 +349,24 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
     }
     // Function starts: ULEB deltas from the start of __TEXT.
     if let (Some((off, size)), Some(t)) = (fstarts, &text) {
-        let mut o = off as usize;
+        let start = off as usize;
         let end = (off as usize).saturating_add(size as usize).min(data.len());
+        let starts = Reader::new(data.get(start..end).unwrap_or(&[]));
+        let mut o = 0;
         let mut addr = t.vmaddr;
-        while o < end && b.function_starts.len() < 2_000_000 {
-            let Some((delta, n)) = r.uleb128(o) else { break };
+        while o < starts.len() && b.function_starts.len() < 2_000_000 {
+            let Some((delta, n)) = starts.uleb128(o) else {
+                b.warnings.push("function-start delta is cut short or invalid".into());
+                break;
+            };
             if delta == 0 {
                 break;
             }
-            addr = addr.wrapping_add(delta);
+            let Some(next) = addr.checked_add(delta) else {
+                b.warnings.push("function-start address overflows".into());
+                break;
+            };
+            addr = next;
             b.function_starts.push(addr);
             o += n;
         }
@@ -337,7 +386,8 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             let desc = r.u16_le(e + 6)?;
             Some((r.cstr(stroff as usize + strx as usize, (strsize - strx) as usize)?, desc))
         };
-        for s in &sections {
+        let mut remaining = MAX_INDIRECT;
+        'sections: for s in &sections {
             let ty = s.flags & 0xff;
             let (entsize, kind) = match ty {
                 6 | 7 | 0x10 => (if is64 { 8 } else { 4 }, "slot"),
@@ -347,12 +397,17 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             if entsize == 0 {
                 continue;
             }
-            let count = (s.size / entsize) as usize;
-            for i in 0..count.min(MAX_INDIRECT) {
+            let count = usize::try_from(s.size / entsize).unwrap_or(usize::MAX);
+            for i in 0..count {
                 let Some(ii) = (s.reserved1 as usize).checked_add(i) else { break };
                 if ii >= nind as usize {
                     break;
                 }
+                if remaining == 0 {
+                    b.warnings.push("indirect symbol limit reached across sections; remaining slots omitted".into());
+                    break 'sections;
+                }
+                remaining -= 1;
                 let Some(sym) = r.u32_le(indoff as usize + ii * 4) else { break };
                 if sym & 0xc000_0000 != 0 {
                     continue;
@@ -471,13 +526,13 @@ fn method_list(data: &[u8], b: &Binary, list: u64, kind: &'static str, out: &mut
     let (Some(ent_flags), Some(count)) = (r.u32_le(0), r.u32_le(4)) else { return };
     let relative = ent_flags & 0x8000_0000 != 0;
     let entsize = u64::from(ent_flags & 0xfffc);
-    if entsize == 0 {
+    if entsize < if relative { 12 } else { 24 } {
         return;
     }
     for i in 0..u64::from(count).min(MAX_METHODS as u64) {
         let Some(e) = i.checked_mul(entsize).and_then(|offset| list.checked_add(8)?.checked_add(offset)) else { break };
+        let Some(raw) = b.read(data, e, entsize as usize).filter(|bytes| bytes.len() as u64 == entsize) else { break };
         if relative {
-            let Some(raw) = b.read(data, e, 12) else { break };
             let rr = Reader::new(raw);
             let rel = |o: usize| rr.u32_le(o).and_then(|v| e.checked_add(o as u64).map(|a| a.wrapping_add(i64::from(v as i32) as u64)));
             let name_field = rel(0);
@@ -661,6 +716,37 @@ mod tests {
         assert_eq!(slot.addr, tk::MACHO_BASE + 0x1000);
         assert_eq!(slot.library.as_deref(), Some("/usr/lib/libSystem.B.dylib"));
         assert_eq!(b.mitigations.pie, Some(true));
+    }
+
+    /// An executable laid out like `/bin/cat` on arm64e: `__TEXT` maps the first 16 KiB of the
+    /// file, and `__DATA` holds only zero-fill sections, so it has no file bytes and its file
+    /// offset is 0, the same as `__TEXT`'s.
+    fn executable_with_zero_fill_data(entryoff: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 72];
+        data[0..4].copy_from_slice(&0x19u32.to_le_bytes());
+        data[4..8].copy_from_slice(&72u32.to_le_bytes());
+        data[8..14].copy_from_slice(b"__DATA");
+        data[24..32].copy_from_slice(&(tk::MACHO_BASE + 0x4000).to_le_bytes());
+        data[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+        data[56..60].copy_from_slice(&3u32.to_le_bytes());
+        data[60..64].copy_from_slice(&3u32.to_le_bytes());
+        let mut main = vec![0u8; 24];
+        main[0..4].copy_from_slice(&0x8000_0028u32.to_le_bytes());
+        main[4..8].copy_from_slice(&24u32.to_le_bytes());
+        main[8..16].copy_from_slice(&entryoff.to_le_bytes());
+        let mut m = tk::apple::macho_min(tk::apple::CPU_ARM64, 2, &[data, main], &[("__text", &[0; 4])]);
+        m.resize(0x4000, 0);
+        m
+    }
+
+    #[test]
+    fn the_entry_point_is_in_the_segment_that_holds_its_file_bytes() {
+        let b = crate::parse_binary(&executable_with_zero_fill_data(0x588)).unwrap();
+        let layout: Vec<_> = b.segments.iter().map(|s| (s.name.as_str(), s.file_offset, s.file_size)).collect();
+        assert_eq!(layout, [("__TEXT", 0, 0x4000), ("__DATA", 0, 0)]);
+        assert_eq!(b.entry, Some(tk::MACHO_BASE + 0x588));
+        // An offset past every segment's file bytes names no code.
+        assert_eq!(crate::parse_binary(&executable_with_zero_fill_data(0x5000)).unwrap().entry, None);
     }
 
     #[test]

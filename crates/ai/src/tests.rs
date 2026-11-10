@@ -7,6 +7,72 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
+/// #1096, #1239: an AI's timeout_secs is its own limit on a streamed answer, starting included;
+/// unset or 0 leaves the defaults.
+#[test]
+fn an_ais_own_timeout_bounds_its_streamed_answer() {
+    let with = |timeout_secs| BackendOptions { timeout_secs, ..Default::default() };
+    assert_eq!(stream_limit(&with(None)), None);
+    assert_eq!(stream_limit(&with(Some(0))), None);
+    assert_eq!(stream_limit(&with(Some(2700))), Some(std::time::Duration::from_secs(2700)));
+}
+
+/// #1225: with no session id saved (a backend added before there was one, or found from an
+/// environment key), OpenCode Go still gets its session header, the same on every request.
+#[test]
+fn opencode_go_gets_a_session_header_without_a_saved_id() {
+    let (h, _d) = hub();
+    assert!(h.config().install_id.is_none(), "nothing saved");
+    let id = h.session_id();
+    assert!(!id.is_empty());
+    assert_eq!(h.session_id(), id, "the same for every request of this run");
+    let client = compatible_client("OpenCode Go", openai::OPENCODE_GO_BASE, Some("sk-test".into()), "m", &id);
+    assert!(client.extra_headers.iter().any(|(name, value)| *name == openai::OPENCODE_GO_SESSION_HEADER && *value == id), "{:?}", client.extra_headers);
+}
+
+/// #1225: a saved OpenCode Go backend with no id (one from an older version, or a copied config)
+/// gets one at startup, once, and keeps it after a restart. A hub with no Go backend makes none.
+#[test]
+fn a_saved_opencode_go_backend_gets_one_stable_session_id_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let keys = || KeyStore::file_only(dir.path().join("ai-keys.toml"));
+    // A hub whose session starts from the settings file, as the app and the CLI do.
+    let started = |path: &std::path::Path| {
+        let mut session = craft_anything_engine::testing::session();
+        session.settings = craft_anything_engine::Settings::load_from(path);
+        AiHub::with_stores(Arc::new(Engine::new(session)), path.to_path_buf(), keys())
+    };
+    let saved_id = || AiConfig::from_table(&craft_anything_engine::Settings::load_from(&path).ai).unwrap().install_id;
+
+    // A Go backend saved the way an older version did: no id in the file.
+    let first = started(&path);
+    add(&first, "OpenCode Go (subscription)", BackendKind::OpenaiCompatible, openai::OPENCODE_GO_BASE, Some("sk-test"));
+    let kept = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, kept.lines().filter(|l| !l.trim_start().starts_with("install_id")).collect::<Vec<_>>().join("\n")).unwrap();
+    assert!(saved_id().is_none(), "the test starts without an id");
+
+    let startup = started(&path);
+    assert!(startup.ensure_session_id().unwrap(), "one is made and saved");
+    let id = saved_id().expect("saved to the settings file");
+    assert!(id.starts_with("craft-"), "{id}");
+    assert!(!startup.ensure_session_id().unwrap(), "made once, not again on the next start");
+    assert_eq!(saved_id().as_deref(), Some(id.as_str()));
+    assert_eq!(started(&path).session_id(), id, "the same id after a restart");
+
+    // No Go backend, no id.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_path = other_dir.path().join("config.toml");
+    let plain = AiHub::with_stores(
+        Arc::new(Engine::new(craft_anything_engine::testing::session())),
+        other_path.clone(),
+        KeyStore::file_only(other_dir.path().join("ai-keys.toml")),
+    );
+    add(&plain, "Claude", BackendKind::Anthropic, "https://api.anthropic.com", Some("sk-test"));
+    assert!(!plain.ensure_session_id().unwrap());
+    assert!(AiConfig::from_table(&craft_anything_engine::Settings::load_from(&other_path).ai).unwrap().install_id.is_none());
+}
+
 /// The model list lives at /v1 on the service root, not under the chat path's /openai/v1.
 #[test]
 fn opencode_go_lists_models_at_the_documented_url() {
@@ -106,6 +172,73 @@ fn a_coding_agent_test_says_it_only_checked_the_version() {
     assert_eq!((r.program.as_deref(), r.saved_program_replaced), (Some("cargo"), None), "the saved program ran");
 }
 
+#[cfg(unix)]
+#[test]
+/// The selected Codex CLI checks sign-in without a prompt or exposing raw status output.
+fn codex_connection_test_checks_login_without_sending_a_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+    let (h, _d) = hub();
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("codex");
+    let signed_in = dir.path().join("connected");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo codex-test; exit 0; fi\nif [ \"$1\" = login ] && [ \"$2\" = status ]; then\n if [ -f '{}' ]; then echo 'Logged in using ChatGPT LOGIN_STATUS_TEST_ONLY' >&2; exit 0; fi\n echo 'Not logged in' >&2; exit 1\nfi\nexit 99\n",
+        signed_in.display()
+    );
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = BackendConfig { name: "Codex test".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true };
+    let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+    h.add_backend_with(BackendEntry { config, options }, None).unwrap();
+    let error = h.test_backend("Codex test").unwrap_err();
+    assert!(error.message.contains("not signed in"));
+    assert!(error.remediation.unwrap().contains("Sign in with ChatGPT"));
+    std::fs::write(signed_in, b"test marker, not a credential").unwrap();
+    let result = h.test_backend("Codex test").unwrap();
+    assert!(result.version_only, "login is not a model/quota test");
+    assert!(result.reply.contains("signed in"));
+    assert!(!serde_json::to_string(&result).unwrap().contains("LOGIN_STATUS_TEST_ONLY"), "raw login-status output never enters the report");
+}
+
+/// A second adapter supplies sign-in results through the same API, respecting its config folder.
+#[cfg(unix)]
+#[test]
+fn local_agent_connection_checks_use_the_adapter_and_its_selected_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let (h, _d) = hub();
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("agent");
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then echo agent-test; exit 0; fi
+if [ "$1" = auth ] && [ "$2" = status ] && [ "$3" = --json ]; then
+ cat "$CLAUDE_CONFIG_DIR/status.json"; exit 0
+fi
+exit 99
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config =
+        BackendConfig { name: "Other agent".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+    let options = BackendOptions { command: Some(program.display().to_string()), config_dir: Some(dir.path().display().to_string()), ..Default::default() };
+    h.add_backend_with(BackendEntry { config, options }, None).unwrap();
+    let status = dir.path().join("status.json");
+    std::fs::write(&status, r#"{"loggedIn":false}"#).unwrap();
+    let error = h.test_backend("Other agent").unwrap_err();
+    assert_eq!(error.message, "Other agent is installed but is not signed in.");
+    assert!(error.remediation.is_some());
+    std::fs::write(&status, r#"{"loggedIn":true,"private":"LOGIN_STATUS_TEST_ONLY"}"#).unwrap();
+    let result = h.test_backend("Other agent").unwrap();
+    assert!(result.version_only && result.reply.contains("signed in"));
+    assert!(!serde_json::to_string(&result).unwrap().contains("LOGIN_STATUS_TEST_ONLY"));
+    for unknown in ["not json", "{}"] {
+        std::fs::write(&status, unknown).unwrap();
+        assert_eq!(h.test_backend("Other agent").unwrap().reply, "agent-test", "unknown sign-in leaves the version reply unchanged");
+    }
+}
+
 /// #721: a saved path an update removed. A test that passes through the usual program says so, and
 /// doctor doesn't blame PATH when nothing can be found.
 #[test]
@@ -169,10 +302,86 @@ fn hub() -> (AiHub, tempfile::TempDir) {
     (h, dir)
 }
 
-/// A CLI stand-in checks saved selections and refuses native execution until its MCP server is wired.
+/// A named backend stays off for chat, including before API or agent setup can run.
+#[test]
+fn disabled_backends_are_refused_when_chat_starts() {
+    let (h, _dir) = hub();
+    for kind in [BackendKind::OpenaiCompatible, BackendKind::AgentCli] {
+        // A malformed tunnel port fails before opening SSH if API setup is reached.
+        let (base_url, ssh_host) =
+            if kind == BackendKind::OpenaiCompatible { ("http://127.0.0.1:not-a-port/v1", Some("unused".into())) } else { ("http://127.0.0.1:0/v1", None) };
+        h.add_backend(
+            BackendConfig { name: "Off".into(), kind, model: "no-such-agent".into(), base_url: Some(base_url.into()), ssh_host, enabled: false },
+            None,
+        )
+        .unwrap();
+        let error = h.start(Some("Off"), false).err().expect("chat must refuse a disabled backend");
+        assert_eq!(error.code, ErrorCode::BadSettings);
+        assert!(error.message.contains("Off") && error.message.contains("turned off"), "{error:?}");
+        assert!(error.remediation.as_deref().is_some_and(|s| s.contains("Settings → AI")), "{error:?}");
+    }
+}
+
+/// R2.9: an API backend's kept transcript is resumed only in the mode that saved it.
+#[test]
+fn an_api_transcript_is_resumed_only_in_its_mode() {
+    let (h, dir) = hub();
+    h.add_backend(
+        BackendConfig {
+            name: "Local".into(),
+            kind: BackendKind::OpenaiCompatible,
+            model: "test-model".into(),
+            base_url: Some("http://127.0.0.1:0/v1".into()),
+            ssh_host: None,
+            enabled: true,
+        },
+        None,
+    )
+    .unwrap();
+    let entry = h.entry("Local").unwrap();
+    let path = dir.path().join("transcript.json");
+    let history = vec![crate::model::Msg::user_text("a Deep conversation")];
+    crate::context::save(&path, &history, true).unwrap();
+    assert!(h.start_builder(&entry, false, Some(path.clone()), true).unwrap().resumed(), "Deep continues a Deep transcript");
+    assert!(!h.start_builder(&entry, false, Some(path.clone()), false).unwrap().resumed(), "Clean room starts fresh");
+    crate::context::save(&path, &history, false).unwrap();
+    assert!(!h.start_builder(&entry, false, Some(path), true).unwrap().resumed(), "Deep doesn't continue a Clean room transcript");
+}
+
+/// Compare checks either position; enabled named and automatic chat choices still work.
+#[test]
+fn disabled_backends_are_refused_on_either_side_of_compare() {
+    let (h, _dir) = hub();
+    for (name, enabled) in [("Off", false), ("On", true), ("Other", true)] {
+        h.add_backend(
+            BackendConfig {
+                name: name.into(),
+                kind: BackendKind::OpenaiCompatible,
+                model: "test-model".into(),
+                base_url: Some("http://127.0.0.1:0/v1".into()),
+                ssh_host: None,
+                enabled,
+            },
+            None,
+        )
+        .unwrap();
+    }
+    for (left, right) in [("Off", "On"), ("On", "Off")] {
+        let error = h.compare(left, right, true).err().expect("compare must refuse a disabled backend");
+        assert_eq!(error.code, ErrorCode::BadSettings);
+        assert!(error.message.contains("Off") && error.message.contains("turned off"), "{error:?}");
+    }
+    assert!(h.start(Some("On"), false).is_ok());
+    assert!(h.start(None, false).is_ok());
+    assert!(h.compare("On", "Other", false).is_ok());
+    let unknown = h.start(Some("Missing"), false).err().unwrap();
+    assert!(unknown.message.contains("No AI backend named"), "{unknown:?}");
+}
+
+/// A CLI stand-in checks saved selections, and an explicit one runs natively with our MCP server.
 #[cfg(unix)]
 #[test]
-fn opencode_selection_is_validated_saved_and_refused_without_native_mcp() {
+fn opencode_selection_is_validated_saved_and_run_natively_with_our_mcp_server() {
     use std::os::unix::fs::PermissionsExt;
     let (h, dir) = hub();
     let program = dir.path().join("agent");
@@ -180,8 +389,9 @@ fn opencode_selection_is_validated_saved_and_refused_without_native_mcp() {
     let seen = dir.path().join("arguments.txt");
     let quote = |p: &std::path::Path| ssh::shell_quote(&p.display().to_string());
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) printf '%s\\n' \"$@\" > {}; printf 'done';;\n*) exit 8;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
         quote(&catalogue),
+        quote(&seen),
         quote(&seen)
     );
     std::fs::write(&program, script).unwrap();
@@ -209,12 +419,13 @@ fn opencode_selection_is_validated_saved_and_refused_without_native_mcp() {
     }
     events.extend(conversation.poll());
     events.retain(|event| !matches!(event, AgentEvent::Status { .. }));
-    assert!(
-        matches!(events.as_slice(), [AgentEvent::Error { message, .. }, AgentEvent::TurnDone { .. }]
-        if message.contains("cannot yet connect")),
-        "{events:?}"
-    );
-    assert!(!seen.exists(), "an explicit selection must not start a run without its MCP server");
+    assert!(matches!(events.last(), Some(AgentEvent::TurnDone { .. })), "{events:?}");
+    // The arguments, one per line, then the config file the run was handed.
+    let ran = std::fs::read_to_string(&seen).unwrap();
+    let args: Vec<&str> = ran.lines().collect();
+    assert_eq!(args.get(..4), Some(["run", "--standalone", "--model", "test/alias#max"].as_slice()), "{ran}");
+    let config: Value = serde_json::from_str(ran.lines().find(|l| l.starts_with("{\"mcp\"")).unwrap()).unwrap();
+    assert_eq!(config["mcp"][cli_agents::MCP_NAME]["type"], "local", "the run gets our MCP server: {ran}");
     assert!(h.set_agent_model("OpenCode", Some("test/alias"), Some(Effort::Xhigh)).is_err());
     assert_eq!(h.options()["OpenCode"].cli_thinking, Some(Effort::Max), "a failed validation changes nothing");
     let stale = h.model_context("OpenCode").unwrap();
@@ -736,7 +947,8 @@ fn anthropic_streaming_tool_loop_through_the_engine() {
     assert!(ev.iter().any(|e| matches!(e, AgentEvent::ToolFinished { tool, ok: true, .. } if tool == "core_session_show")));
     assert!(ev.iter().any(|e| matches!(e, AgentEvent::ToolFinished { tool, ok: true, .. } if tool == "core_targets_list")));
     let AgentEvent::TurnDone { backend, input_tokens, output_tokens, cost_usd, .. } = ev.last().unwrap().clone() else { panic!() };
-    assert_eq!((backend.as_str(), input_tokens, output_tokens), ("Claude", 300, 50));
+    // The 90 cached tokens count as input, as agent apps report them.
+    assert_eq!((backend.as_str(), input_tokens, output_tokens), ("Claude", 390, 50));
     assert!(cost_usd.unwrap() > 0.0);
 
     let seen = seen.lock().unwrap();
@@ -1100,6 +1312,40 @@ fn fenced_legacy_react_calls_still_execute() {
 }
 
 #[test]
+fn a_qwen_markup_call_to_a_missing_tool_is_answered_and_the_build_goes_on() {
+    // A live build stopped here: the server handed back a call to a tool it wasn't offered as
+    // text, and the loop took the text for the final answer.
+    let missing = "<tool_call>\n<function=web_search>\n<parameter=query>\neframe screenshot example\n</parameter>\n</function>\n</tool_call>";
+    let real = "<tool_call>\n<function=core_session_show>\n</function>\n</tool_call>";
+    let replies = [missing, real, "Nothing open."]
+        .map(|text| (200, "text/event-stream", chat_sse(&[json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]})])));
+    let (url, seen) = mock(replies.into());
+    let (hub, _dir) = hub();
+    let config = BackendConfig {
+        name: "Local".into(),
+        kind: BackendKind::OpenaiCompatible,
+        model: "scripted".into(),
+        base_url: Some(url),
+        ssh_host: None,
+        enabled: true,
+    };
+    hub.add_backend_with(BackendEntry { config, options: BackendOptions::default() }, None).unwrap();
+    let mut conversation = hub.start(Some("Local"), true).unwrap();
+    let events = run(&mut conversation, "status?");
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolFinished { tool, ok: true, .. } if tool == "core_session_show")).count(), 1, "{events:?}");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolStarted { tool, .. } if tool == "web_search")), "{events:?}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "the turn must go on after the missing tool");
+    let told = seen[1].body["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(told["role"], "user");
+    let told = told["content"].as_str().unwrap();
+    assert!(told.contains("`web_search` isn't a tool you can use here") && told.contains("core_session_show"), "{told}");
+    // The call that ran is paired with its result in the next request.
+    let last = seen[2].body["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "tool", "{last}");
+}
+
+#[test]
 fn json_text_recovery_preserves_non_actions_and_stop_reasons() {
     use crate::model::{Effort, Msg, Stop, StopReason, ToolDef, TurnRequest};
     let tools = [ToolDef { name: "look".into(), description: "Look at a file".into(), schema: json!({"type":"object"}) }];
@@ -1231,4 +1477,47 @@ fn openrouter_with_no_provider_for_tools_falls_back_to_the_text_protocol() {
     assert_eq!(seen[0].body["provider"], json!({"require_parameters": true}));
     assert!(seen[0].body.get("tools").is_some());
     assert!(seen[1].body.get("provider").is_none() && seen[1].body.get("tools").is_none(), "the second asks in text: {}", seen[1].body);
+}
+
+/// #1213: with no max_tokens, OpenRouter holds the model's whole output limit against the key's
+/// credit and answers 402 with what it can afford; the request is sent once more capped at that.
+#[test]
+fn openrouter_asks_again_for_an_answer_the_key_can_afford() {
+    use crate::model::{Effort, Msg, Stop, TurnRequest};
+    let messages = [Msg::user_text("hi")];
+    let request = TurnRequest { system: "S", messages: &messages, tools: &[], effort: Effort::Low, max_tokens: 100 };
+    let refusal = |n: u64| {
+        let message = format!(
+            "This request requires more credits, or fewer max_tokens. You requested up to 131072 tokens, but can only afford {n}. To increase, visit https://openrouter.ai/settings/credits and add more credits"
+        );
+        (402, "application/json", json!({"error": {"code": 402, "message": message}}).to_string())
+    };
+    let reply = || (200, "text/event-stream", chat_sse(&[json!({"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]})]));
+    let (url, seen) = mock(vec![refusal(35063), reply(), reply()]);
+    let mut model = openai::OpenAi::openrouter(Some(&url), "k".into(), "moonshotai/kimi-k3.1-pro");
+    assert_eq!(model.turn(&request, &mut |_| {}, &Stop::default()).unwrap().message.text(), "hello");
+    assert_eq!(model.turn(&request, &mut |_| {}, &Stop::default()).unwrap().message.text(), "hello");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one retry, then the cap is kept");
+        assert!(seen[0].body.get("max_tokens").is_none());
+        assert_eq!(seen[1].body["max_tokens"], 35063);
+        assert_eq!(seen[2].body["max_tokens"], 35063, "the next turn doesn't ask for more again");
+    }
+
+    // Too little left to write a file, or the same refusal under the cap: it stays a billing error.
+    for (cap, n) in [(None, 1000), (Some(35063), 35063)] {
+        let (url, seen) = mock(vec![refusal(n), reply()]);
+        let mut model = openai::OpenAi::openrouter(Some(&url), "k".into(), "moonshotai/kimi-k3.1-pro");
+        model.answer_cap = cap;
+        let e = model.turn(&request, &mut |_| {}, &Stop::default()).unwrap_err();
+        assert!(e.message.contains("402"), "{}", e.message);
+        assert!(!crate::TurnFailure::from_api(&e).retryable());
+        assert_eq!(seen.lock().unwrap().len(), 1, "not asked again");
+    }
+    // Only OpenRouter is asked again.
+    let (url, seen) = mock(vec![refusal(35063), reply()]);
+    let mut other = openai::OpenAi::compatible("Other", &url, Some("k".into()), "m");
+    assert!(other.turn(&request, &mut |_| {}, &Stop::default()).is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }

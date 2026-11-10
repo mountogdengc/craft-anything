@@ -1,0 +1,20 @@
+[package]
+name = "craft-anything-planning"
+description = "Native planning extension: durable scope, required inputs and verified acceptance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-anything-evidence = { workspace = true }
+craft-anything-platform = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

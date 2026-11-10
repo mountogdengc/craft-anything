@@ -661,19 +661,31 @@ mod tests {
         ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
         let texts = [
             ("Korean", "한국어 사용자"),
+            ("Georgian", "ქართული ენა"),
             ("Chinese", "你好，世界"),
             ("Japanese", "こんにちは、カタカナ"),
             ("Thai", "ภาษาไทย"),
             ("Arabic", "مرحبا بالعالم"),
             ("Hebrew", "שלום עולם"),
             ("Hindi", "नमस्ते दुनिया"),
-            ("Vietnamese", "Tiếng Việt"),
+            // All 12 Vietnamese vowels with each of the six tones, and đ, in both cases (146 letters):
+            // people type any of them, not just the ones the catalog uses.
+            (
+                "Vietnamese",
+                "Tiếng Việt a à á ả ã ạ ă ằ ắ ẳ ẵ ặ â ầ ấ ẩ ẫ ậ e è é ẻ ẽ ẹ ê ề ế ể ễ ệ i ì í ỉ ĩ ị o ò ó ỏ õ ọ ô ồ ố ổ ỗ ộ ơ ờ ớ ở ỡ ợ u ù ú ủ ũ ụ ư ừ ứ ử ữ ự y ỳ ý ỷ ỹ ỵ đ A À Á Ả Ã Ạ Ă Ằ Ắ Ẳ Ẵ Ặ Â Ầ Ấ Ẩ Ẫ Ậ E È É Ẻ Ẽ Ẹ Ê Ề Ế Ể Ễ Ệ I Ì Í Ỉ Ĩ Ị O Ò Ó Ỏ Õ Ọ Ô Ồ Ố Ổ Ỗ Ộ Ơ Ờ Ớ Ở Ỡ Ợ U Ù Ú Ủ Ũ Ụ Ư Ừ Ứ Ử Ữ Ự Y Ỳ Ý Ỷ Ỹ Ỵ Đ",
+            ),
             ("Russian", "Привет"),
             ("Greek", "Γειά σου"),
             ("arrows", "Settings → AI ← ↑ ↓"),
         ];
         for (script, text) in texts {
             for font in [FontId::proportional(14.0), FontId::monospace(14.0), medium(14.0), semibold(14.0)] {
+                // egui's bundled Hack (monospace) draws Georgian itself, and it is also the face egui
+                // takes as its "no glyph" marker (it has U+25FB), so `has_glyphs` reports boxes for
+                // it. The craft-fonts face is checked through the other three families.
+                if script == "Georgian" && font.family == FontFamily::Monospace {
+                    continue;
+                }
                 assert!(ctx.fonts_mut(|f| f.has_glyphs(&font, text)), "{script} ({text}) shows as boxes in {font:?}");
             }
         }
@@ -729,6 +741,8 @@ mod tests {
                 }
             }
             assert!(contrast(t.on_accent, t.accent) >= 4.5, "{k:?} text on the app colour: {:.2}", contrast(t.on_accent, t.accent));
+            // Send's icon on its hover colour (an icon, so 3:1).
+            assert!(contrast(t.on_accent, t.accent_hover) >= 3.0, "{k:?} icon on the hover colour: {:.2}", contrast(t.on_accent, t.accent_hover));
             assert!(contrast(t.field_border, t.canvas) >= 3.0, "{k:?} control borders: {:.2}", contrast(t.field_border, t.canvas));
             // Main buttons are ink-filled with the canvas colour as their label.
             assert!(contrast(t.canvas, t.text) >= 4.5, "{k:?} main buttons");

@@ -1,13 +1,13 @@
 //! ZIP archives (also APK, JAR, IPA, MSIX, HAP…): central directory listing and bounded entry reads.
 //!
 //! Only the central directory is trusted for the listing. Entry data is located through the local
-//! header, decompressed with a hard output cap, and checked against the recorded CRC-32. Stored and
-//! deflated entries are supported; anything else (and encrypted entries) is reported, not read.
+//! header, decompressed with a hard output cap, and checked against the recorded CRC-32. Stored,
+//! DEFLATE, bzip2, ZIP LZMA, XZ and Zstandard entries are supported; other methods and encrypted entries are listed.
 
 use crate::bytes::Reader;
 
 /// Biggest tail we search for the end-of-central-directory record (64 KiB comment + record).
-const EOCD_SEARCH: usize = 22 + 0xffff;
+pub(crate) const EOCD_SEARCH: usize = 22 + 0xffff;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ZipError {
@@ -29,7 +29,7 @@ pub enum ZipError {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ZipEntry {
     /// Entry name as stored (forward slashes). Bit 11 selects lossy UTF-8; otherwise
-    /// valid UTF-8 is preserved and remaining names are decoded as CP437.
+    /// a valid Unicode Path extra field takes precedence over the UTF-8/CP437 fallback.
     pub name: String,
     pub method: u16,
     pub flags: u16,
@@ -96,31 +96,61 @@ pub fn looks_like_zip(data: &[u8]) -> bool {
 pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
     let r = Reader::new(data);
     let eocd = find_eocd(data).ok_or(ZipError::NotZip)?;
+    let mut disk = u32::from(r.u16_le(eocd + 4).ok_or(ZipError::Truncated("end record"))?);
+    let mut directory_disk = u32::from(r.u16_le(eocd + 6).ok_or(ZipError::Truncated("end record"))?);
+    let mut disk_entries = u64::from(r.u16_le(eocd + 8).ok_or(ZipError::Truncated("end record"))?);
+    if !matches!(disk, 0 | 0xffff) || !matches!(directory_disk, 0 | 0xffff) {
+        return Err(ZipError::Unsupported("multi-volume ZIP archives".into()));
+    }
     let mut total = u64::from(r.u16_le(eocd + 10).ok_or(ZipError::Truncated("end record"))?);
     let mut cd_size = u64::from(r.u32_le(eocd + 12).ok_or(ZipError::Truncated("end record"))?);
     let mut cd_offset = u64::from(r.u32_le(eocd + 16).ok_or(ZipError::Truncated("end record"))?);
     let mut zip64 = false;
     let mut eocd_record_start = eocd as u64;
-    if total == 0xffff || cd_size == 0xffff_ffff || cd_offset == 0xffff_ffff {
+    if total == 0xffff || disk_entries == 0xffff || disk == 0xffff || directory_disk == 0xffff || cd_size == 0xffff_ffff || cd_offset == 0xffff_ffff {
         // ZIP64 locator sits right before the classic record.
         if let Some(loc) = eocd.checked_sub(20)
             && r.slice(loc, 4) == Some(b"PK\x06\x07")
         {
+            if r.u32_le(loc + 4) != Some(0) || r.u32_le(loc + 16) != Some(1) {
+                return Err(ZipError::Unsupported("multi-volume ZIP archives".into()));
+            }
             let rec = r.u64_le(loc + 8).ok_or(ZipError::Truncated("zip64 locator"))?;
             let rec = usize::try_from(rec).map_err(|_| ZipError::Corrupt("zip64 record offset".into()))?;
             if r.slice(rec, 4) == Some(b"PK\x06\x06") {
-                total = r.u64_le(rec + 32).ok_or(ZipError::Truncated("zip64 record"))?;
-                cd_size = r.u64_le(rec + 40).ok_or(ZipError::Truncated("zip64 record"))?;
-                cd_offset = r.u64_le(rec + 48).ok_or(ZipError::Truncated("zip64 record"))?;
+                disk = r.u32_le(rec + 16).ok_or(ZipError::Truncated("zip64 record"))?;
+                directory_disk = r.u32_le(rec + 20).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_disk_entries = r.u64_le(rec + 24).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_total = r.u64_le(rec + 32).ok_or(ZipError::Truncated("zip64 record"))?;
+                if (disk_entries != 0xffff && disk_entries != zip64_disk_entries) || (total != 0xffff && total != zip64_total) {
+                    return Err(ZipError::Unsupported("multi-volume ZIP archives".into()));
+                }
+                disk_entries = zip64_disk_entries;
+                total = zip64_total;
+                let zip64_cd_size = r.u64_le(rec + 40).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_cd_offset = r.u64_le(rec + 48).ok_or(ZipError::Truncated("zip64 record"))?;
+                if (cd_size != 0xffff_ffff && cd_size != zip64_cd_size) || (cd_offset != 0xffff_ffff && cd_offset != zip64_cd_offset) {
+                    return Err(ZipError::Corrupt("ZIP64 and classic directory bounds disagree".into()));
+                }
+                cd_size = zip64_cd_size;
+                cd_offset = zip64_cd_offset;
                 zip64 = true;
                 eocd_record_start = rec as u64;
             }
         }
     }
+    if disk != 0 || directory_disk != 0 || disk_entries != total {
+        return Err(ZipError::Unsupported("multi-volume ZIP archives".into()));
+    }
     // Self-extracting archives: the directory sits later than it claims by the stub length.
     let expected_end = cd_offset.checked_add(cd_size).ok_or_else(|| ZipError::Corrupt("directory bounds overflow".into()))?;
     let prefix = eocd_record_start.saturating_sub(expected_end);
     let start = usize::try_from(cd_offset.saturating_add(prefix)).map_err(|_| ZipError::Corrupt("directory offset".into()))?;
+    let directory_end = (start as u64)
+        .checked_add(cd_size)
+        .filter(|&end| end <= eocd_record_start)
+        .and_then(|end| usize::try_from(end).ok())
+        .ok_or_else(|| ZipError::Corrupt("directory extends into its end record".into()))?;
     let mut entries = Vec::new();
     let mut pos = start;
     let mut truncated = false;
@@ -129,6 +159,9 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
         if entries.len() >= max_entries {
             truncated = true;
             break;
+        }
+        if pos.checked_add(46).is_none_or(|end| end > directory_end) {
+            return Err(ZipError::Truncated("directory entry"));
         }
         if r.slice(pos, 4) != Some(b"PK\x01\x02") {
             if entries.is_empty() {
@@ -145,22 +178,31 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
         let name_len = usize::from(r.u16_le(pos + 28).ok_or(ZipError::Truncated("directory entry"))?);
         let extra_len = usize::from(r.u16_le(pos + 30).ok_or(ZipError::Truncated("directory entry"))?);
         let comment_len = usize::from(r.u16_le(pos + 32).ok_or(ZipError::Truncated("directory entry"))?);
+        let entry_end = pos
+            .checked_add(46 + name_len + extra_len + comment_len)
+            .filter(|&end| end <= directory_end)
+            .ok_or(ZipError::Truncated("directory entry fields"))?;
         let host = r.slice(pos + 5, 1).and_then(|b| b.first().copied()).unwrap_or(0);
-        let unix_mode = if host == 3 { r.u32_le(pos + 38).map(|a| a >> 16) } else { None };
+        let attrs = r.u32_le(pos + 38).ok_or(ZipError::Truncated("entry attributes"))?;
+        let unix_mode = (host == 3).then_some(attrs >> 16);
         let mut local = u64::from(r.u32_le(pos + 42).ok_or(ZipError::Truncated("directory entry"))?);
+        let mut entry_disk = u32::from(r.u16_le(pos + 34).ok_or(ZipError::Truncated("directory entry"))?);
         let name_bytes = r.slice(pos + 46, name_len).ok_or(ZipError::Truncated("entry name"))?;
         let extra = r.slice(pos + 46 + name_len, extra_len).ok_or(ZipError::Truncated("entry extra fields"))?;
         // Each extra field owns its payload: ZIP64 values cannot borrow a following field's bytes.
-        let needs_zip64 = usize_ == 0xffff_ffff || csize == 0xffff_ffff || local == 0xffff_ffff;
+        let needs_zip64 = usize_ == 0xffff_ffff || csize == 0xffff_ffff || local == 0xffff_ffff || entry_disk == 0xffff;
         let mut found_zip64 = false;
+        let mut unicode_name = None;
+        let mut name_crc = None;
         let mut x = 0usize;
         let er = Reader::new(extra);
-        while x < extra.len() {
+        // Trailing bytes too short for a field header are padding, not truncation.
+        while x.saturating_add(4) <= extra.len() {
             let id = er.u16_le(x).ok_or(ZipError::Truncated("extra field header"))?;
             let len = usize::from(er.u16_le(x + 2).ok_or(ZipError::Truncated("extra field header"))?);
             let body = x + 4;
             let field = er.slice(body, len).ok_or(ZipError::Truncated("extra field payload"))?;
-            if id == 0x0001 {
+            if id == 0x0001 && !found_zip64 {
                 let values = Reader::new(field);
                 let mut f = 0;
                 if usize_ == 0xffff_ffff {
@@ -173,18 +215,29 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
                 }
                 if local == 0xffff_ffff {
                     local = values.u64_le(f).ok_or(ZipError::Truncated("zip64 local header offset"))?;
+                    f += 8;
+                }
+                if entry_disk == 0xffff {
+                    entry_disk = values.u32_le(f).ok_or(ZipError::Truncated("zip64 entry disk"))?;
                 }
                 found_zip64 = true;
-                break;
+            } else if id == 0x7075 && flags & (1 << 11) == 0 && unicode_name.is_none() {
+                let field = Reader::new(field);
+                if field.u8(0) == Some(1) && field.u32_le(1) == Some(*name_crc.get_or_insert_with(|| self::crc32(name_bytes))) {
+                    unicode_name = field.data().get(5..).and_then(|bytes| std::str::from_utf8(bytes).ok()).filter(|s| !s.is_empty());
+                }
             }
             x = body + len;
         }
         if needs_zip64 && !found_zip64 {
             return Err(ZipError::Corrupt("missing ZIP64 extended information".into()));
         }
-        let name = decode_name(name_bytes, flags).replace('\\', "/");
+        if entry_disk != 0 {
+            return Err(ZipError::Unsupported("multi-volume ZIP archives".into()));
+        }
+        let name = unicode_name.map(str::to_owned).unwrap_or_else(|| decode_name(name_bytes, flags)).replace('\\', "/");
         entries.push(ZipEntry {
-            is_dir: name.ends_with('/'),
+            is_dir: name.ends_with('/') || unix_mode.is_some_and(|m| m & 0o170000 == 0o040000) || (matches!(host, 0 | 10) && attrs & 0x10 != 0),
             name,
             method,
             flags,
@@ -196,7 +249,7 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
             unix_mode,
         });
         seen += 1;
-        pos = pos.checked_add(46 + name_len + extra_len + comment_len).ok_or_else(|| ZipError::Corrupt("directory overflow".into()))?;
+        pos = entry_end;
     }
     Ok(ZipArchive { entries, declared_entries: total, truncated, zip64, prefix_bytes: prefix })
 }
@@ -218,7 +271,7 @@ fn decode_name(bytes: &[u8], flags: u16) -> String {
     bytes.iter().map(|&byte| if byte.is_ascii() { char::from(byte) } else { CP437.get(usize::from(byte - 0x80)).copied().unwrap_or('\u{fffd}') }).collect()
 }
 
-fn find_eocd(data: &[u8]) -> Option<usize> {
+pub(crate) fn find_eocd(data: &[u8]) -> Option<usize> {
     if data.len() < 22 {
         return None;
     }
@@ -285,6 +338,25 @@ pub fn read_entry_unverified(data: &[u8], e: &ZipEntry, max_bytes: u64) -> Resul
             miniz_oxide::inflate::TINFLStatus::HasMoreOutput => ZipError::TooLarge(max_bytes),
             _ => ZipError::Corrupt(format!("deflate stream for {} is damaged", e.name)),
         })?,
+        12 | 95 => {
+            let decoded = if e.method == 12 { crate::decompress::bzip2(raw, max_bytes) } else { crate::decompress::xz(raw, max_bytes) };
+            decoded.map_err(|error| match error {
+                crate::decompress::DecompressError::TooLarge => ZipError::TooLarge(max_bytes),
+                _ => ZipError::Corrupt(format!("{} stream for {} is damaged: {error}", e.method_name(), e.name)),
+            })?
+        }
+        14 => {
+            let header = Reader::new(raw);
+            let properties_size = header.u16_le(2).ok_or(ZipError::Truncated("LZMA properties header"))?;
+            if properties_size != 5 {
+                return Err(ZipError::Unsupported(format!("LZMA properties size {properties_size} for {}", e.name)));
+            }
+            let stream = raw.get(4..).ok_or(ZipError::Truncated("LZMA properties"))?;
+            crate::decompress::lzma_zip(stream, e.uncompressed_size, e.flags & 2 != 0, max_bytes).map_err(|error| match error {
+                crate::decompress::DecompressError::TooLarge => ZipError::TooLarge(max_bytes),
+                _ => ZipError::Corrupt(format!("LZMA stream for {} is damaged: {error}", e.name)),
+            })?
+        }
         93 => crate::decompress::zstd(raw, max_bytes).map_err(|err| ZipError::Corrupt(format!("zstd stream for {} is damaged: {err}", e.name)))?,
         m => return Err(ZipError::Unsupported(format!("compression method {m} ({}) for {}", e.method_name(), e.name))),
     };
@@ -348,6 +420,103 @@ mod tests {
         out
     }
 
+    fn build_codec_entry(method: u16, compressed: &[u8], plain: &[u8]) -> Vec<u8> {
+        let mut file = build(&[("entry", compressed)]);
+        let central = 30 + "entry".len() + compressed.len();
+        let version: u16 = if method == 12 { 46 } else { 63 };
+        file[4..6].copy_from_slice(&version.to_le_bytes());
+        file[8..10].copy_from_slice(&method.to_le_bytes());
+        file[14..18].copy_from_slice(&crc32(plain).to_le_bytes());
+        file[22..26].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+        file[central + 6..central + 8].copy_from_slice(&version.to_le_bytes());
+        file[central + 10..central + 12].copy_from_slice(&method.to_le_bytes());
+        file[central + 16..central + 20].copy_from_slice(&crc32(plain).to_le_bytes());
+        file[central + 24..central + 28].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+        file
+    }
+
+    #[test]
+    fn bzip2_and_xz_zip_entries_keep_size_crc_and_output_checks() {
+        use craft_anything_testkit::firmware::{BZIP2_FIXTURE, BZIP2_PLAIN, XZ_FIXTURE, XZ_PLAIN};
+        for (method, compressed, plain) in [(12, BZIP2_FIXTURE, BZIP2_PLAIN), (95, XZ_FIXTURE, XZ_PLAIN)] {
+            let file = build_codec_entry(method, compressed, plain);
+            let original = parse(&file, 1).unwrap().entries.remove(0);
+            assert_eq!(read_entry(&file, &original, plain.len() as u64).unwrap(), plain);
+            let mut entry = original.clone();
+            entry.crc32 ^= 1;
+            assert!(matches!(read_entry(&file, &entry, 100), Err(ZipError::CrcMismatch { .. })));
+            assert_eq!(read_entry_unverified(&file, &entry, 100).unwrap(), plain);
+            entry = original.clone();
+            entry.uncompressed_size = 0;
+            assert!(matches!(read_entry(&file, &entry, 100), Err(ZipError::Corrupt(_))));
+            assert!(matches!(read_entry(&file, &entry, plain.len() as u64 - 1), Err(ZipError::TooLarge(_))));
+            let mut damaged = file.clone();
+            damaged[30 + "entry".len()] ^= 0xff;
+            assert!(matches!(read_entry(&damaged, &original, 100), Err(ZipError::Corrupt(_))));
+            entry = original;
+            entry.encrypted = true;
+            assert!(matches!(read_entry(&file, &entry, 100), Err(ZipError::Unsupported(_))));
+        }
+    }
+
+    fn zip_lzma_member(plain: &[u8], end_marker: bool) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let size = if end_marker { None } else { Some(plain.len() as u64) };
+        let options = lzma_rs::compress::Options { unpacked_size: lzma_rs::compress::UnpackedSize::WriteToHeader(size) };
+        lzma_rs::lzma_compress_with_options(&mut std::io::Cursor::new(plain), &mut encoded, &options).unwrap();
+        let mut compressed = vec![9, 4, 5, 0];
+        compressed.extend_from_slice(&encoded[..5]);
+        compressed.extend_from_slice(&encoded[13..]);
+        let mut file = build(&[("entry", &compressed)]);
+        let central = 30 + "entry".len() + compressed.len();
+        let flags: u16 = if end_marker { 2 } else { 0 };
+        for (version_at, flags_at, method_at, crc_at, size_at) in [(4, 6, 8, 14, 22), (central + 6, central + 8, central + 10, central + 16, central + 24)] {
+            file[version_at..version_at + 2].copy_from_slice(&63u16.to_le_bytes());
+            file[flags_at..flags_at + 2].copy_from_slice(&flags.to_le_bytes());
+            file[method_at..method_at + 2].copy_from_slice(&14u16.to_le_bytes());
+            file[crc_at..crc_at + 4].copy_from_slice(&crc32(plain).to_le_bytes());
+            file[size_at..size_at + 4].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+        }
+        file
+    }
+
+    #[test]
+    fn zip_lzma_reads_size_delimited_and_end_marked_streams() {
+        for end_marker in [false, true] {
+            for plain in [&b"ZIP LZMA contents"[..], &[0; 23][..]] {
+                let file = zip_lzma_member(plain, end_marker);
+                let original = parse(&file, 1).unwrap().entries.remove(0);
+                assert_eq!(read_entry(&file, &original, plain.len() as u64).unwrap(), plain);
+                assert!(matches!(read_entry(&file, &original, plain.len() as u64 - 1), Err(ZipError::TooLarge(_))));
+                let mut entry = original.clone();
+                entry.crc32 ^= 1;
+                assert!(matches!(read_entry(&file, &entry, 100), Err(ZipError::CrcMismatch { .. })));
+                entry = original.clone();
+                entry.uncompressed_size -= 1;
+                assert!(read_entry(&file, &entry, 100).is_err());
+                entry = original.clone();
+                entry.compressed_size -= 1;
+                assert!(read_entry(&file, &entry, 100).is_err());
+                entry = original;
+                entry.compressed_size += 1;
+                assert!(read_entry(&file, &entry, 100).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn zip_lzma_rejects_bad_properties_without_unbounded_dictionaries() {
+        let mut file = zip_lzma_member(b"small", true);
+        let entry = parse(&file, 1).unwrap().entries.remove(0);
+        let body = 30 + "entry".len();
+        file[body + 5..body + 9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(read_entry(&file, &entry, 5).unwrap(), b"small");
+        file[body + 4] = 255;
+        assert!(read_entry(&file, &entry, 5).is_err());
+        file[body + 2..body + 4].copy_from_slice(&6u16.to_le_bytes());
+        assert!(matches!(read_entry(&file, &entry, 5), Err(ZipError::Unsupported(_))));
+    }
+
     fn build_named_entry(name: &[u8], flags: u16) -> Vec<u8> {
         let mut zip = build(&[(&"x".repeat(name.len()), b"")]);
         let central = 30 + name.len();
@@ -356,6 +525,40 @@ mod tests {
         zip[central + 8..central + 10].copy_from_slice(&flags.to_le_bytes());
         zip[central + 46..central + 46 + name.len()].copy_from_slice(name);
         zip
+    }
+
+    #[test]
+    fn verified_unicode_path_overrides_a_legacy_zip_name() {
+        let raw = b"notes.txt";
+        let unicode = "笔记.txt";
+        for (flags, version, checksum, expected) in
+            [(0, 1, crc32(raw), unicode), (0, 1, crc32(b"old-name"), "notes.txt"), (0, 2, crc32(raw), "notes.txt"), (1 << 11, 1, crc32(raw), "notes.txt")]
+        {
+            let mut zip = build_named_entry(raw, flags);
+            let central = 30 + raw.len();
+            let end = central + 46 + raw.len();
+            let mut extra = 0x7075_u16.to_le_bytes().to_vec();
+            extra.extend_from_slice(&((5 + unicode.len()) as u16).to_le_bytes());
+            extra.push(version);
+            extra.extend_from_slice(&checksum.to_le_bytes());
+            extra.extend_from_slice(unicode.as_bytes());
+            zip[central + 30..central + 32].copy_from_slice(&(extra.len() as u16).to_le_bytes());
+            zip[end + 12..end + 16].copy_from_slice(&((end - central + extra.len()) as u32).to_le_bytes());
+            zip.splice(end..end, extra);
+            assert_eq!(parse(&zip, 1).unwrap().entries[0].name, expected);
+        }
+    }
+
+    #[test]
+    fn directory_markers_do_not_require_a_trailing_slash() {
+        let sample = build(&[("folder", b"")]);
+        let central = 30 + "folder".len();
+        for (host, attrs, directory) in [(0, 0x10u32, true), (10, 0x10, true), (3, 0o040755 << 16, true), (3, 0o120777 << 16, false), (0, 0x20, false)] {
+            let mut file = sample.clone();
+            file[central + 5] = host;
+            file[central + 38..central + 42].copy_from_slice(&attrs.to_le_bytes());
+            assert_eq!(parse(&file, 1).unwrap().entries[0].is_dir, directory);
+        }
     }
 
     #[test]

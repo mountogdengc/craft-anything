@@ -8,9 +8,21 @@ use super::*;
 /// The round a builder's own check is run as; real rounds start at 1.
 pub const SELF_CHECK_ROUND: u32 = 0;
 
+/// How long one of the builder's own checks may take. The build waits for it, so a check still
+/// going after this is stopped and reported. Longer than a build's own steps need.
+pub const SELF_CHECK_LIMIT: Duration = Duration::from_secs(30 * 60);
+
 /// Where `rebuild_check` asks a project's run for a check.
 pub fn asks_dir(project: &Path) -> PathBuf {
     project.join("checks").join("asks")
+}
+
+/// The mark a run leaves beside a check request it has taken, until it answers, so
+/// `rebuild_check` can tell a check that is still going from a request no run took. None for an
+/// id that isn't an inbox id (a request's file can carry any `id`): no mark outside the folder.
+pub fn taken_mark(project: &Path, id: &str) -> Option<PathBuf> {
+    let valid = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid.then(|| asks_dir(project).join(format!("{id}.taken")))
 }
 
 /// Projects whose build runs in this process. A builder in this process (an API backend) calls
@@ -44,15 +56,21 @@ pub fn building_here(root: &Path) -> bool {
 /// The questions the builder recorded (`core_unknown_add`, kept in the project's investigation
 /// folder) that aren't resolved yet, most severe first. Read from disk: the builder's tool server
 /// writes them while this run works.
-pub fn open_questions(ws: &Workspace) -> Vec<craft_anything_evidence::Unknown> {
-    let mut open: Vec<_> = Project::open(&ws.investigation_dir())
-        .and_then(|p| p.load_unknowns())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|u| u.status != craft_anything_evidence::UnknownStatus::Resolved)
-        .collect();
+pub fn open_questions(ws: &Workspace) -> Result<Vec<craft_anything_evidence::Unknown>, ToolError> {
+    let dir = ws.investigation_dir();
+    // A new workspace need not have an investigation yet. An existing one must be readable.
+    match std::fs::metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(ToolError::io(dir.display(), e)),
+        Ok(_) => {}
+    }
+    let questions = Project::open(&dir).and_then(|p| p.load_unknowns()).map_err(|e| {
+        ToolError::new(e.code, format!("The investigation questions could not be read: {}", e.message))
+            .with_remediation("Repair the investigation records, then check again. Unreadable questions cannot be treated as resolved.")
+    })?;
+    let mut open: Vec<_> = questions.into_iter().filter(|u| u.status != craft_anything_evidence::UnknownStatus::Resolved).collect();
     open.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.question.cmp(&b.question)));
-    open
+    Ok(open)
 }
 
 /// One plain line on how a round of checks went: how alike when compared, else how many checks
@@ -68,6 +86,21 @@ pub fn summary(checks: &[CheckResult], good_enough: f64) -> String {
         None if good == checks.len() => format!("all {} checks pass{claims_part}", checks.len()),
         None => format!("{good} of {} checks pass{claims_part}", checks.len()),
     }
+}
+
+/// Shared by the builder's check and final completion, so a passing last check cannot hide
+/// a failed claim, missing comparison or an unresolved question essential to the recreation.
+pub(super) fn require_ready(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_evidence::Unknown]) -> Result<(), ToolError> {
+    let verdict = CheckVerdict::latest(checks, good_enough);
+    if !verdict.is_ready() {
+        return Err(ToolError::new(ErrorCode::ProgramFailed, verdict.explanation())
+            .with_remediation("Review the failed checks and missing observations, then continue the project."));
+    }
+    if let Some(question) = open.iter().find(|u| u.severity >= craft_anything_evidence::Severity::High) {
+        return Err(ToolError::new(ErrorCode::NotFound, format!("The recreation is not ready: {}", question.question))
+            .with_remediation("Observe the missing behavior and resolve the investigation question with evidence, then check again."));
+    }
+    Ok(())
 }
 
 /// What the builder is told about its own check: each result with its likeness and the bar,
@@ -105,10 +138,13 @@ pub fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_e
     if !pictures.is_empty() {
         lines.push(format!("Pictures of your build (compare each with the original's in capture/ or reference/): {}", pictures.join(", ")));
     }
-    lines.push(if checks.iter().all(|c| c.good(good_enough)) {
-        "This would pass. Finish what you're doing, then reply.".to_string()
-    } else {
-        "Not good enough yet: fix what it lists, build again, and check again with rebuild_check.".to_string()
+    lines.push(match require_ready(checks, good_enough, open) {
+        Ok(()) => "This would pass. Finish what you're doing, then reply.".to_string(),
+        Err(error) if checks.iter().any(|check| check.not_compared) => format!(
+            "{} Get a readable picture with native_window_capture or ask the person with core_person_ask. Keep this result incomplete until the reference can be compared; more builder turns alone cannot provide the missing evidence.",
+            error.message
+        ),
+        Err(e) => format!("{} Not good enough yet: fix what it lists, build again, and check again with rebuild_check.", e.message),
     });
     lines.join("\n")
 }
@@ -119,21 +155,35 @@ impl Worker {
         let Some((kind, good_enough)) = self.self_check.clone() else { return Ok(()) };
         let asks = Inbox::new(asks_dir(&ws.root));
         for r in asks.pending() {
-            let checking = if ws.manifest.target == TargetRef::None {
-                "The builder is checking its work…"
-            } else {
-                "The builder is checking its work against the original…"
-            };
+            let mark = taken_mark(&ws.root, &r.id);
+            if let Some(mark) = &mark
+                && let Err(e) = std::fs::write(mark, b"")
+            {
+                log::warn!("couldn't mark the builder's check as taken ({}): {e}", mark.display());
+            }
+            let checking = "The builder is checking its work and available evidence…";
             self.step(ws, Step::Build, Status::Building, checking)?;
-            let (text, line) = match self.run_checks(ws, kind.as_ref(), SELF_CHECK_ROUND) {
+            let checked = self.checks_unless_unchanged(ws, kind.as_ref(), SELF_CHECK_ROUND, || {
+                self.run_checks_within(ws, kind.as_ref(), SELF_CHECK_ROUND, Some(SELF_CHECK_LIMIT))
+            });
+            let (text, line) = match checked {
                 Ok(checks) => {
                     let line = format!("The builder checked its work: {}.", summary(&checks, good_enough));
-                    (report(&checks, good_enough, &open_questions(ws)), line)
+                    match open_questions(ws) {
+                        Ok(open) => (report(&checks, good_enough, &open), line),
+                        Err(e) => (
+                            format!("{} Readiness is unverified until the investigation can be read.", e.message),
+                            "The investigation questions could not be checked.".to_string(),
+                        ),
+                    }
                 }
                 Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
                 Err(e) => (format!("The check couldn't run: {}", e.message), "The builder's check couldn't run.".to_string()),
             };
             asks.answer(&r.id, &Answer { text: Some(text), ..Default::default() })?;
+            if let Some(mark) = &mark {
+                let _ = std::fs::remove_file(mark);
+            }
             self.step(ws, Step::Build, Status::Building, &line)?;
         }
         Ok(())
@@ -196,14 +246,14 @@ mod tests {
         use craft_anything_evidence::{Severity, Unknown, UnknownStatus};
         let d = tempfile::tempdir().unwrap();
         let ws = Workspace::create(d.path(), "Arena", "Recreate this game", TargetRef::None).unwrap();
-        assert!(open_questions(&ws).is_empty(), "no investigation folder yet");
+        assert!(open_questions(&ws).unwrap().is_empty(), "no investigation folder yet");
         let project = Project::create(&ws.investigation_dir(), "Arena", Purpose::default()).unwrap();
         project.store_unknown(&Unknown::new("Jump height?", "game", Severity::Low)).unwrap();
         project.store_unknown(&Unknown::new("Which font is the menu set in?", "ui", Severity::High)).unwrap();
         let mut done = Unknown::new("Map size?", "game", Severity::Critical);
         done.status = UnknownStatus::Resolved;
         project.store_unknown(&done).unwrap();
-        let open = open_questions(&ws);
+        let open = open_questions(&ws).unwrap();
         let questions: Vec<&str> = open.iter().map(|u| u.question.as_str()).collect();
         assert_eq!(questions, ["Which font is the menu set in?", "Jump height?"], "unresolved only, most severe first");
         let r = report(&[CheckResult::new(CheckResult::BUILD, 0, true, "Build succeeded.")], 90.0, &open);

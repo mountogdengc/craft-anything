@@ -7,6 +7,7 @@
 //! holding it never freezes a frame; the last snapshot ([`SessionView`]) is shown meanwhile.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod approvals;
 pub mod build_plan;
 pub mod builders;
 pub mod chat;
@@ -157,6 +158,7 @@ pub enum Done {
     },
     /// What a scan found, and why an expected coding agent may be missing.
     Detected(Vec<Detected>, Vec<craft_anything_ai::detect::DetectHint>),
+    AgentConnection(String, Result<String, String>),
     /// The configured backends, the ones chosen to build with and to extract with, and each one's
     /// options.
     Backends(Vec<BackendConfig>, Option<String>, Option<String>, std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>),
@@ -453,6 +455,10 @@ pub struct CraftApp {
     /// Why an expected coding agent may be missing, from the last scan.
     pub detect_hints: Vec<craft_anything_ai::detect::DetectHint>,
     pub detecting: bool,
+    /// Local agent checks: None while the worker runs, then a credential-free status or error.
+    pub agent_connections: std::collections::BTreeMap<String, Option<Result<String, String>>>,
+    /// Which agent owns each pending check, including failures before the worker body starts.
+    pub(crate) agent_connection_jobs: std::collections::BTreeMap<u64, String>,
     /// Counts AI choices, so an add that finishes later doesn't undo one made meanwhile.
     pub backend_choices: u64,
     pub log: Vec<LogLine>,
@@ -489,6 +495,7 @@ pub struct CraftApp {
     pub asked: std::collections::HashMap<PathBuf, Vec<just_ask::Asked>>,
     /// Every project's pinned builds, and whether they're running (read by `refresh_pins`).
     pub pins: Vec<pins::PinRow>,
+    pub pinned_copy_bytes: Option<u64>,
     pub pins_read_at: Option<Instant>,
     /// An address to open in the browser on the next frame (set from a worker's result).
     open_url: Option<String>,
@@ -572,6 +579,8 @@ impl CraftApp {
             detected: None,
             detect_hints: Vec::new(),
             detecting: false,
+            agent_connections: Default::default(),
+            agent_connection_jobs: Default::default(),
             backend_choices: 0,
             log: Vec::new(),
             key_inputs: Default::default(),
@@ -589,6 +598,7 @@ impl CraftApp {
             projects: Vec::new(),
             preview: None,
             pins: Vec::new(),
+            pinned_copy_bytes: None,
             asked: Default::default(),
             pins_read_at: None,
             open_url: None,
@@ -623,6 +633,8 @@ impl CraftApp {
     pub fn setup_context(ctx: &egui::Context) {
         theme::install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
+        // The zoom keys are ours (`shortcuts`), so zoom stays inside ZOOM_RANGE.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
     }
 
     /// Gives the macOS app its menu bar (nothing elsewhere). Call once the window is open.
@@ -973,6 +985,7 @@ impl CraftApp {
                 }
                 self.toast(tr("Called done. A new message carries on from here."), false);
             }
+            ("project_approvals_set", r) => self.approval_set(r),
             ("project_questions_set", Ok(v)) => {
                 // What was saved (the person's other changes on disk come along).
                 if let Some(ws) = self.workspace.as_mut().filter(|w| v["project"].as_str().is_some_and(|p| w.root == std::path::Path::new(p))) {
@@ -1207,6 +1220,21 @@ impl CraftApp {
         self.jobs.spawn("Look for AI on this computer", true, move |_| Ok(Done::Detected(hub.detect(), hub.detect_hints())));
     }
 
+    /// Check a selected local agent through the headless API without blocking the UI.
+    pub fn check_agent_connection(&mut self, name: String) {
+        if self.agent_connections.get(&name) == Some(&None) {
+            return;
+        }
+        self.agent_connections.insert(name.clone(), None);
+        let hub = self.hub.clone();
+        let agent = name.clone();
+        let job = self.jobs.spawn("Check", true, move |_| {
+            let status = hub.test_backend(&agent).map(|report| report.reply).map_err(|error| error.for_people());
+            Ok(Done::AgentConnection(agent, status))
+        });
+        self.agent_connection_jobs.insert(job, name);
+    }
+
     pub fn add_backend(&mut self, config: BackendConfig, key: Option<String>) {
         let hub = self.hub.clone();
         let name = config.name.clone();
@@ -1247,7 +1275,12 @@ impl CraftApp {
         if self.state.backend.is_some() && self.conversation.is_none() {
             match self.hub.start(self.state.backend.as_deref(), self.beginner()) {
                 Ok(c) => self.conversation = Some(c),
-                Err(e) => self.state.chat.push(ChatItem::Error { message: e.message, remediation: e.remediation, log: None }),
+                // The AI that was picked didn't start (it may be turned off), so the error is the
+                // answer; an AI is set up, so the built-in engines' "no AI brain" line would be wrong.
+                Err(e) => {
+                    self.state.chat.push(ChatItem::Error { message: e.message, remediation: e.remediation, log: None });
+                    return;
+                }
             }
         }
         if let Some(c) = self.conversation.as_mut() {
@@ -1382,6 +1415,7 @@ impl CraftApp {
     /// Apply a completed background job, reporting failures and accepting picker results only for matching requests.
     fn handle_done(&mut self, done: jobs::Finished<Done>) {
         let job = done.job;
+        let checked_agent = self.agent_connection_jobs.remove(&job);
         if self.saving == Some(job) {
             self.saving = None;
         }
@@ -1392,6 +1426,9 @@ impl CraftApp {
         let done = match done.result {
             Ok(d) => d,
             Err(e) => {
+                if let Some(agent) = checked_agent {
+                    self.agent_connections.insert(agent, Some(Err(e.clone())));
+                }
                 self.detecting = false;
                 self.facts_read(job, None);
                 // A failed or cancelled engine download frees the button to try again.
@@ -1408,7 +1445,12 @@ impl CraftApp {
         };
         match done {
             Done::Nothing => {}
-            Done::Projects(p) => {
+            Done::Projects(mut p) => {
+                if let Some(ws) = &self.workspace
+                    && !p.iter().any(|w| w.root == ws.root)
+                {
+                    p.insert(0, ws.clone());
+                }
                 self.projects = p;
                 self.refresh_pins();
             }
@@ -1460,6 +1502,9 @@ impl CraftApp {
                 self.detecting = false;
                 self.log(false, format!("Found {} AI option(s) on this computer", d.len()));
                 self.detected = Some(d);
+            }
+            Done::AgentConnection(name, result) => {
+                self.agent_connections.insert(name, Some(result));
             }
             Done::Backends(b, builder, extractor, options) => {
                 if self.state.backend.as_ref().is_some_and(|n| !b.iter().any(|c| &c.name == n)) {
@@ -1758,9 +1803,7 @@ impl CraftApp {
         menu::update(self, &ctx);
         let t = theme::Tokens::get(&ctx);
         // The title bar is on every screen: it is how the window moves, resizes and closes.
-        egui::Panel::top("titlebar").exact_size(titlebar::HEIGHT).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
-            guard_ui(ui, "title bar", |ui| titlebar::show(self, ui));
-        });
+        titlebar::bar(self, ui);
         self.stuck_banner(ui, &ctx);
         if !self.settings.first_run_done {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(t.canvas)).show(ui, |ui| guard_ui(ui, "first run", |ui| first_run::show(self, ui)));
@@ -1879,6 +1922,24 @@ impl CraftApp {
         if palette {
             palette::toggle(self);
         }
+        // Cmd/Ctrl + / − / 0. A zoom saved from outside the range comes back inside it.
+        let zoom = ctx.zoom_factor();
+        let asked = ctx.input_mut(|i| {
+            use egui::gui_zoom::kb_shortcuts::{ZOOM_IN, ZOOM_IN_SECONDARY, ZOOM_OUT, ZOOM_RESET};
+            if i.consume_shortcut(&ZOOM_RESET) {
+                1.0
+            } else if i.consume_shortcut(&ZOOM_IN) || i.consume_shortcut(&ZOOM_IN_SECONDARY) {
+                zoom + 0.1
+            } else if i.consume_shortcut(&ZOOM_OUT) {
+                zoom - 0.1
+            } else {
+                zoom
+            }
+        });
+        let next = bounded_zoom(asked);
+        if next != zoom {
+            ctx.set_zoom_factor(next);
+        }
         if esc {
             if self.state.palette.open {
                 self.state.palette.open = false;
@@ -1892,6 +1953,18 @@ impl CraftApp {
             }
         }
     }
+}
+
+/// How far the app zooms (Cmd/Ctrl + / −). Below half size its text is unreadable; above double,
+/// the smallest window has room for almost nothing. egui's own limits are 20% and 500%.
+pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+
+/// `zoom` on a 10% step, inside [`ZOOM_RANGE`].
+pub fn bounded_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() {
+        return 1.0;
+    }
+    ((zoom * 10.0).round() / 10.0).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
 }
 
 /// The 256 px app icon.
@@ -1977,6 +2050,7 @@ impl eframe::App for CraftApp {
         for j in self.jobs.running() {
             j.cancel.cancel();
         }
+        craft_anything_engine::tools::deep::stop_analyses(std::time::Duration::from_secs(12));
         // A change not written yet (or one being written as the window closed) is written now.
         if self.persist && (self.settings_dirty || self.save_due.is_some() || self.saving.is_some()) {
             let saved = if let Some(mut session) = self.engine.try_session() {

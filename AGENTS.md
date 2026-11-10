@@ -19,6 +19,7 @@ crates/
   js         L1  JavaScript/Electron/web bundles: parse, module graph, IPC, source maps, unbundling
   analysis   L2  Analyzers producing evidence (triage, dossiers, trace, compare, app graph, rebuild ledger)
   platform   L2  Native services: owned processes, PTY capture, sandbox, engine store, atomic files
+  planning   L3  Native planning extension: policy, versioned state and readable plan
   engines    L3  Optional external engines: Ghidra bridge (Deep mode), adb, CDP, Frida, JADX, Apktool…
   engine     L4  Session, projects (.cany), workspaces (what the person is making), the inbox
                  (questions/approvals), ToolSpec registry, settings, consent, the tool list
@@ -40,7 +41,8 @@ Layering is enforced by `cargo xtask layers`. Register new crates in `xtask/src/
    `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!`/`unreachable!`/indexing on input-derived values in non-test
    code; every production crate root carries the deny attribute. Checked arithmetic, bounded recursion, capped
    allocations. Every crash fix gets a regression test.
-2. **Everything is a tool.** User-visible behaviour = a `ToolSpec` in `crates/engine/src/tools/<area>.rs` with id,
+2. **Everything is a tool.** User-visible behaviour = a `ToolSpec` in `crates/engine/src/tools/<area>.rs` (or a native extension
+   adapter registered through `tools/mod.rs`) with id,
    title, summary, beginner text, toolset, effects, requires, a schemars params struct, and `run`. Register the
    module with one line in `tools/mod.rs`. UI, CLI, MCP and the AI agent all dispatch by id. Programmatic calls
    never open dialogs.
@@ -150,6 +152,7 @@ It is part of these rules: read it before your first change (Claude Code loads i
 
 ```sh
 cargo fmt --all
+cargo build -p craft-anything-cli   # if you touched crates/ai: two of its tests start this helper
 cargo test -p <crates you touched>
 cargo clippy -p <crates> --all-targets -- -D warnings
 cargo xtask layers

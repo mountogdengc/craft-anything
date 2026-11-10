@@ -224,7 +224,9 @@ pub fn conversation(app: &mut CraftApp, ui: &mut Ui, dense: bool) {
     // The history gets exactly what the composer leaves (its height is measured last frame), so
     // a panel never grows to fit us.
     let comp_id = ui.id().with(("composer-h", dense));
-    let comp_h = ui.data(|d| d.get_temp::<f32>(comp_id)).unwrap_or(if dense { 48.0 } else { 70.0 });
+    // Before the first measure, a guess that isn't short: anything left over on that frame grows
+    // the console's panel, and it keeps that size.
+    let comp_h = ui.data(|d| d.get_temp::<f32>(comp_id)).unwrap_or(if dense { 125.0 } else { 70.0 });
     // The item spacing after the history counts too. Anything here that comes out taller than the
     // space given makes the agent console's panel grow by that much every frame, until it reaches
     // its maximum and the top of its tab strip is cut off.
@@ -334,7 +336,7 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, dense: bool) {
             crate::prompt_box::PromptBox {
                 name: "Ask a question",
                 hint,
-                rows: (1, if dense { 4 } else { 8 }),
+                rows: if dense { (3, 4) } else { (1, 8) },
                 attach: None,
                 previews: &[],
                 stop_button: answering.then_some("Stop"),
@@ -456,7 +458,7 @@ fn item_ui(ui: &mut Ui, item: &ChatItem, beginner: bool, dense: bool, open: bool
                 egui::Frame::new().fill(t.raised).corner_radius(t.r_sm()).inner_margin(Margin::symmetric(10, 3)).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         icons::show(ui, icon, 13.0, col);
-                        ui.label(RichText::new(tool.replace('_', " ")).font(theme::mono(12.5)).color(t.text_dim));
+                        ui.label(RichText::new(tool.replace('_', " ")).font(theme::mono(theme::CAPTION)).color(t.text_dim));
                     });
                 });
                 if !summary.is_empty() {
@@ -700,7 +702,7 @@ fn paragraph(ui: &mut Ui, text: &str, bullet: bool, with_glossary: bool, body: &
 fn code_block(ui: &mut Ui, code: &str, t: &Tokens) {
     egui::Frame::new().fill(t.code_bg).corner_radius(t.r()).inner_margin(Margin::same(10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.add(egui::Label::new(RichText::new(code.trim_end()).font(theme::mono(12.5)).color(t.text)).wrap());
+        ui.add(egui::Label::new(RichText::new(code.trim_end()).font(theme::mono(theme::CAPTION)).color(t.text)).wrap());
     });
 }
 

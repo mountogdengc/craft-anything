@@ -19,6 +19,7 @@ craft-anything-analysis = { path = "crates/analysis" }
 craft-anything-platform = { path = "crates/platform" }
 craft-anything-engines = { path = "crates/engines" }
 craft-anything-engine = { path = "crates/engine" }
+craft-anything-planning = { path = "crates/planning" }
 craft-anything-ai = { path = "crates/ai" }
 craft-anything-mcp = { path = "crates/mcp" }
 craft-anything-setup = { path = "crates/setup" }
