@@ -307,6 +307,10 @@ pub enum AgentEvent {
 /// A chat with the agent about the current session.
 pub trait Conversation: Send {
     fn send(&mut self, text: &str);
+    /// Prefer this tool until a real successful result during the next turn. API transports
+    /// that support named tool choice enforce it; other adapters use the accompanying prompt.
+    /// Callers still validate persisted effects before advancing a workflow.
+    fn require_tool(&mut self, _tool: Option<&str>) {}
     /// Retry an interrupted turn. Stateless adapters resend `text`; a conversation that keeps
     /// its own history can continue it without appending the user's message again.
     fn retry(&mut self, text: &str) {
@@ -1089,7 +1093,14 @@ fn req_parts() -> Vec<Msg> {
 }
 
 fn req_owned(msgs: &[Msg]) -> TurnRequest<'_> {
-    TurnRequest { system: "You are a connectivity check. Answer in one word.", messages: msgs, tools: &[], effort: Effort::High, max_tokens: 2048 }
+    TurnRequest {
+        system: "You are a connectivity check. Answer in one word.",
+        messages: msgs,
+        tools: &[],
+        required_tool: None,
+        effort: Effort::High,
+        max_tokens: 2048,
+    }
 }
 
 fn reach(e: &BackendEntry, key: Option<String>) -> Result<u64, String> {

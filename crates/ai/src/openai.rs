@@ -130,6 +130,9 @@ impl OpenAi {
         let mut system = req.system.to_string();
         if self.react && !req.tools.is_empty() {
             system.push_str(&react_instructions(req.tools));
+            if let Some(tool) = req.required_tool {
+                system.push_str(&format!("\nYour next Action must call {tool}. Wait for its real Observation before summarizing."));
+            }
         }
         let mut messages = vec![json!({"role": "system", "content": system})];
         let mut dropped_empty_assistant = false;
@@ -177,7 +180,8 @@ impl OpenAi {
                 .map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.schema}}))
                 .collect();
             o.insert("tools".into(), Value::Array(tools));
-            o.insert("tool_choice".into(), json!("auto"));
+            let choice = req.required_tool.map_or_else(|| json!("auto"), |tool| json!({"type":"function","function":{"name":tool}}));
+            o.insert("tool_choice".into(), choice);
             // OpenRouter picks an upstream provider per request, and one that can't do tool calls
             // answers "400: Provider returned error" (#369). Only a provider that supports every
             // parameter in the request is used.
@@ -1284,12 +1288,24 @@ mod tests {
     }
 
     #[test]
+    fn required_text_tools_keep_the_text_protocol_instead_of_native_tool_choice() {
+        let tools = [ToolDef { name: "save".into(), description: "Save state".into(), schema: json!({"type":"object"}) }];
+        let req = TurnRequest { system: "S", messages: &[], tools: &tools, required_tool: Some("save"), effort: Effort::Low, max_tokens: 100 };
+        let mut client = OpenAi::compatible("Local", "http://127.0.0.1:1234/v1", None, "scripted");
+        client.react = true;
+        let body = client.body(&req);
+        assert!(body.get("tools").is_none() && body.get("tool_choice").is_none());
+        let instructions = body["messages"][0]["content"].as_str().unwrap();
+        assert!(instructions.contains("Action Input:") && instructions.contains("next Action must call save"));
+    }
+
+    #[test]
     fn openrouter_only_routes_a_tool_request_to_providers_that_support_tools() {
         use crate::model::{Effort, ToolDef, TurnRequest};
         let tools = [ToolDef { name: "look".into(), description: "d".into(), schema: json!({"type": "object"}) }];
         let messages = [Msg::user_text("hi")];
-        let with_tools = TurnRequest { system: "S", messages: &messages, tools: &tools, effort: Effort::Low, max_tokens: 100 };
-        let without = TurnRequest { system: "S", messages: &messages, tools: &[], effort: Effort::Low, max_tokens: 100 };
+        let with_tools = TurnRequest { system: "S", messages: &messages, tools: &tools, required_tool: None, effort: Effort::Low, max_tokens: 100 };
+        let without = TurnRequest { system: "S", messages: &messages, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 100 };
         let router = OpenAi::openrouter(None, "k".into(), "moonshotai/kimi-k3");
         assert_eq!(router.body(&with_tools)["provider"], json!({"require_parameters": true}));
         assert!(router.body(&without).get("provider").is_none(), "nothing to require without tools");
@@ -1319,7 +1335,7 @@ mod tests {
         };
         let msgs = vec![Msg::user_text("q"), assistant, results];
         let tools = vec![ToolDef { name: "t".into(), description: "d".into(), schema: json!({"type":"object"}) }];
-        let b = local.body(&TurnRequest { system: "S", messages: &msgs, tools: &tools, effort: Effort::Low, max_tokens: 100 });
+        let b = local.body(&TurnRequest { system: "S", messages: &msgs, tools: &tools, required_tool: None, effort: Effort::Low, max_tokens: 100 });
         let m = b["messages"].as_array().unwrap();
         assert_eq!(m[0]["role"], "system");
         assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
@@ -1329,7 +1345,7 @@ mod tests {
         assert_eq!(b["tool_choice"], "auto");
         let mut react = local.clone();
         react.react = true;
-        let b = react.body(&TurnRequest { system: "S", messages: &msgs, tools: &tools, effort: Effort::Low, max_tokens: 100 });
+        let b = react.body(&TurnRequest { system: "S", messages: &msgs, tools: &tools, required_tool: None, effort: Effort::Low, max_tokens: 100 });
         assert!(b.get("tools").is_none());
         assert!(b["messages"][0]["content"].as_str().unwrap().contains("Action Input:"));
         // A call made natively before the switch is sent as the protocol's lines, never as an empty
@@ -1400,7 +1416,7 @@ mod tests {
         let mut o = OpenAi::compatible("Kimi", "http://127.0.0.1:9", Some("sk-test".into()), "kimi");
         o.react = true;
         let msgs = [user("first"), blank, user("second")];
-        let b = o.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 100 });
+        let b = o.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 100 });
         assert_eq!(b["messages"].as_array().map(Vec::len), Some(2), "system, then the joined user turn");
         let wire = b["messages"].as_array().unwrap();
         assert!(wire.iter().all(|m| m["role"] != "assistant"), "{wire:?}");
@@ -1437,7 +1453,7 @@ mod tests {
     fn dropped_empty_assistant_merges_adjacent_user_text_messages() {
         let client = OpenAi::compatible("test", "http://127.0.0.1", None, "test-model");
         let msgs = vec![Msg::user_text("First instruction"), Msg { role: Speaker::Assistant, blocks: vec![] }, Msg::user_text("Second instruction")];
-        let b = client.body(&TurnRequest { system: "S", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 100 });
+        let b = client.body(&TurnRequest { system: "S", messages: &msgs, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 100 });
         let m = b["messages"].as_array().unwrap();
         assert_eq!(m.len(), 2, "system + 1 merged user message expected, got: {m:?}");
         assert_eq!(m[0]["role"], "system");
@@ -1453,7 +1469,7 @@ mod tests {
             Msg { role: Speaker::Assistant, blocks: vec![Block::Text { text: "Acknowledged".into() }] },
             Msg::user_text("Second instruction"),
         ];
-        let b = client.body(&TurnRequest { system: "S", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 100 });
+        let b = client.body(&TurnRequest { system: "S", messages: &msgs, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 100 });
         let m = b["messages"].as_array().unwrap();
         assert_eq!(m.len(), 4, "system + user + assistant + user expected: {m:?}");
         assert_eq!(m[1]["content"], "First instruction");
@@ -1465,7 +1481,7 @@ mod tests {
     fn adjacent_user_messages_without_dropped_assistant_stay_separate() {
         let client = OpenAi::compatible("test", "http://127.0.0.1", None, "test-model");
         let msgs = vec![Msg::user_text("First instruction"), Msg::user_text("Second instruction")];
-        let b = client.body(&TurnRequest { system: "S", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 100 });
+        let b = client.body(&TurnRequest { system: "S", messages: &msgs, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: 100 });
         let m = b["messages"].as_array().unwrap();
         assert_eq!(m.len(), 3, "system + 2 separate user messages expected: {m:?}");
         assert_eq!(m[1]["content"], "First instruction");

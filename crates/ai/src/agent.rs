@@ -288,6 +288,7 @@ impl Default for LoopConfig {
 const LOCAL_BUILDER_CORE: &[&str] = &[
     "core_person_ask",
     "core_investigation_show",
+    "core_build_plan_show",
     "core_build_plan_update",
     "rebuild_check",
     "rebuild_words",
@@ -314,6 +315,8 @@ pub struct AgentLoop {
     history: Vec<Msg>,
     system: Option<String>,
     enabled: BTreeSet<Toolset>,
+    /// Kept across interrupted provider requests; only a real successful call releases it.
+    required_tool: Option<String>,
     cfg: LoopConfig,
     events: Sender<AgentEvent>,
     waiters: Waiters,
@@ -357,6 +360,7 @@ impl AgentLoop {
 
     /// Handle one user message to completion.
     pub fn handle(&mut self, text: &str) {
+        self.required_tool = None;
         self.handle_turn(Some(text));
     }
 
@@ -400,8 +404,19 @@ impl AgentLoop {
             }
             turns += 1;
             let tools = self.tool_defs();
+            let required_tool = self.required_tool.clone();
+            if let Some(tool) = required_tool.as_deref()
+                && !tools.iter().any(|definition| definition.name == tool)
+            {
+                self.emit(AgentEvent::Error {
+                    message: format!("The required setup tool {tool} is not available in this conversation."),
+                    remediation: Some("Enable the tool's group or choose a builder that supports it, then try again.".into()),
+                    log: None,
+                });
+                break;
+            }
             let system = self.system.clone().unwrap_or_default();
-            let Some(result) = self.one_turn(&system, &tools, effort, &mut msg_usage, &mut msg_cost) else { break };
+            let Some(result) = self.one_turn(&system, &tools, required_tool.as_deref(), effort, &mut msg_usage, &mut msg_cost) else { break };
             self.last_input = result.usage.input_tokens + result.usage.cache_read_tokens + result.usage.cache_write_tokens;
             self.last_history_estimate = context::estimate_tokens(&self.history).max(1);
             let (slot_name, local, model_id) = match self.chain.get(self.current) {
@@ -447,6 +462,12 @@ impl AgentLoop {
                 StopReason::ToolUse if !uses.is_empty() => {
                     self.history.push(result.message);
                     let results = self.run_tools(&uses);
+                    if uses.iter().zip(&results).any(|((id, name, _), result)| {
+                        required_tool.as_deref() == Some(name.as_str())
+                            && matches!(result, Block::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == id)
+                    }) {
+                        self.required_tool = None;
+                    }
                     self.history.push(Msg { role: Speaker::User, blocks: results });
                     self.save_transcript();
                     if self.failed_builds >= MAX_FAILED_BUILDS {
@@ -572,7 +593,7 @@ impl AgentLoop {
         let cut = context::cut_point(&self.history)?;
         self.emit(AgentEvent::Status { text: "Making room: summarising the earlier work…".into() });
         let messages = context::with_summary_request(&self.history[..cut]);
-        let req = TurnRequest { system, messages: &messages, tools: &[], effort: Effort::Low, max_tokens: crate::anthropic::MAX_TOKENS };
+        let req = TurnRequest { system, messages: &messages, tools: &[], required_tool: None, effort: Effort::Low, max_tokens: crate::anthropic::MAX_TOKENS };
         let stop = self.stop.clone();
         let summary = self.chain.get_mut(self.current).map(|slot| slot.model.turn(&req, &mut |_| {}, &stop));
         let mut accounted = None;
@@ -617,6 +638,7 @@ impl AgentLoop {
         &mut self,
         system: &str,
         tools: &[ToolDef],
+        required_tool: Option<&str>,
         effort: Effort,
         msg_usage: &mut Usage,
         msg_cost: &mut Option<f64>,
@@ -635,7 +657,7 @@ impl AgentLoop {
             let events = self.events.clone();
             let mut produced = false;
             let stop = self.stop.clone();
-            let req = TurnRequest { system, messages: &self.history, tools, effort, max_tokens: crate::anthropic::MAX_TOKENS };
+            let req = TurnRequest { system, messages: &self.history, tools, required_tool, effort, max_tokens: crate::anthropic::MAX_TOKENS };
             let slot = self.chain.get_mut(self.current)?;
             let r = slot.model.turn(
                 &req,
@@ -819,7 +841,8 @@ fn wait_answer(rx: &Receiver<bool>, stop: &Stop) -> Option<bool> {
 
 /// A conversation with an API backend: a worker thread runs [`AgentLoop`].
 pub struct ApiConversation {
-    to_worker: Sender<Option<String>>,
+    to_worker: Sender<(Option<String>, Option<String>)>,
+    required_tool: Option<String>,
     events: Receiver<AgentEvent>,
     busy: Arc<AtomicBool>,
     stop: Stop,
@@ -841,7 +864,7 @@ impl ApiConversation {
             return Err(ToolError::unavailable("No AI backend could be started.").with_remediation("Add one in Settings → AI."));
         }
         let (etx, erx) = std::sync::mpsc::channel();
-        let (wtx, wrx) = std::sync::mpsc::channel::<Option<String>>();
+        let (wtx, wrx) = std::sync::mpsc::channel::<(Option<String>, Option<String>)>();
         let busy = Arc::new(AtomicBool::new(false));
         let stop = Stop::default();
         let cancel = Arc::new(Mutex::new(CancelToken::default()));
@@ -857,6 +880,7 @@ impl ApiConversation {
             history,
             system: None,
             enabled,
+            required_tool: None,
             cfg,
             events: etx.clone(),
             waiters: waiters.clone(),
@@ -873,7 +897,10 @@ impl ApiConversation {
         std::thread::Builder::new()
             .name("ai-agent".into())
             .spawn(move || {
-                while let Ok(text) = wrx.recv() {
+                while let Ok((text, required_tool)) = wrx.recv() {
+                    if text.is_some() {
+                        agent.required_tool = required_tool;
+                    }
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent.handle_turn(text.as_deref())));
                     if r.is_err() {
                         let _ = etx.send(AgentEvent::Error {
@@ -886,7 +913,7 @@ impl ApiConversation {
                 }
             })
             .map_err(|e| ToolError::internal(format!("couldn't start the AI worker: {e}")))?;
-        Ok(ApiConversation { to_worker: wtx, events: erx, busy, stop, cancel, waiters, queued: Vec::new(), resumed, failure })
+        Ok(ApiConversation { to_worker: wtx, required_tool: None, events: erx, busy, stop, cancel, waiters, queued: Vec::new(), resumed, failure })
     }
 
     /// It continues a conversation kept in its transcript file.
@@ -897,7 +924,7 @@ impl ApiConversation {
     fn submit(&mut self, text: Option<String>) {
         *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.busy.store(true, Ordering::SeqCst);
-        if self.to_worker.send(text).is_err() {
+        if self.to_worker.send((text, self.required_tool.clone())).is_err() {
             self.busy.store(false, Ordering::SeqCst);
             self.queued.push(AgentEvent::Error {
                 message: "The assistant isn't running any more.".into(),
@@ -911,6 +938,10 @@ impl ApiConversation {
 impl Conversation for ApiConversation {
     fn send(&mut self, text: &str) {
         self.submit(Some(text.to_string()));
+    }
+
+    fn require_tool(&mut self, tool: Option<&str>) {
+        self.required_tool = tool.map(str::to_string);
     }
 
     fn retry(&mut self, _text: &str) {
@@ -1172,6 +1203,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unoffered_required_tool_stops_before_spending_a_model_turn() {
+        let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+        let seen = Arc::default();
+        let model =
+            Scripted { turns: VecDeque::from([turn(vec![Block::Text { text: "Nothing to do.".into() }], StopReason::EndTurn)]), seen: Arc::clone(&seen) };
+        let slot = ModelSlot { name: "Fake".into(), model: Box::new(model), local: false, effort: None, max_turns: 10, context_tokens: 0 };
+        let mut conversation = ApiConversation::start(host.clone(), vec![slot], LoopConfig::default()).unwrap();
+        conversation.require_tool(Some("danger"));
+        conversation.send("Finish setup.");
+        let events = drain_until_done(&mut conversation, |_, _| {});
+        assert!(
+            events.iter().any(|event| matches!(event, AgentEvent::Error { message, .. } if message.contains("danger") && message.contains("not available")))
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(host.calls.lock().unwrap().is_empty());
+        conversation.require_tool(None);
+        conversation.send("Answer normally.");
+        let events = drain_until_done(&mut conversation, |_, _| {});
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "Nothing to do.")));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_after_a_saved_tool_does_not_require_the_save_again() {
+        struct RequiredScripted {
+            inner: Scripted,
+            requirements: Arc<Mutex<Vec<Option<String>>>>,
+        }
+        impl ChatModel for RequiredScripted {
+            fn turn(&mut self, req: &TurnRequest<'_>, delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
+                self.requirements.lock().unwrap().push(req.required_tool.map(str::to_string));
+                self.inner.turn(req, delta, stop)
+            }
+            fn model(&self) -> String {
+                "scripted".into()
+            }
+        }
+        let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+        let requirements = Arc::default();
+        let model = RequiredScripted {
+            inner: Scripted {
+                turns: VecDeque::from([
+                    turn(vec![Block::ToolUse { id: "saved".into(), name: "look".into(), input: json!({}) }], StopReason::ToolUse),
+                    Err(ToolError::new(ErrorCode::ProgramFailed, "Synthetic service interruption")),
+                    turn(vec![Block::Text { text: "Saved.".into() }], StopReason::EndTurn),
+                ]),
+                seen: Arc::default(),
+            },
+            requirements: Arc::clone(&requirements),
+        };
+        let slot = ModelSlot { name: "Fake".into(), model: Box::new(model), local: false, effort: None, max_turns: 10, context_tokens: 0 };
+        let mut conversation = ApiConversation::start(host.clone(), vec![slot], LoopConfig::default()).unwrap();
+        conversation.require_tool(Some("look"));
+        conversation.send("Save the setup.");
+        let events = drain_until_done(&mut conversation, |_, _| {});
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Error { .. })));
+        conversation.retry("Continue the interrupted reply.");
+        let events = drain_until_done(&mut conversation, |_, _| {});
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "Saved.")));
+        assert_eq!(*requirements.lock().unwrap(), vec![Some("look".into()), None, None]);
+        assert_eq!(host.calls.lock().unwrap().len(), 1, "the confirmed operation is not repeated");
+    }
+
+    #[test]
     fn consent_toolsets_and_one_result_message() {
         let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1425,6 +1520,7 @@ pub(crate) mod tests {
             history: vec![Msg::user_text("Build it")],
             system: None,
             enabled: BTreeSet::from([Toolset::Core]),
+            required_tool: None,
             cfg: LoopConfig::default(),
             events,
             waiters: Arc::default(),
