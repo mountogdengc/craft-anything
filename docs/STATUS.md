@@ -1,10 +1,20 @@
 # Status
 
 What works today and how it was checked. The plan, owners and order of work are in
-[ROADMAP.md](ROADMAP.md). Last updated 2026-11-10. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
+[ROADMAP.md](ROADMAP.md). Last updated 2026-11-11. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
 workspace clippy, layers, fmt and the secret scan of all history were clean. Chinese UI checks are listed separately below.
 
 ## What works, and how it was checked
+
+### Recognizable development builds (R5.8)
+
+Debug builds show `Craft Anything 0.4.0 — Planning Dev` in the drawn title bar and native window
+title; the version comes from the package manifest. Release builds retain the standard title.
+The app's identity and saved preferences remain shared with the installed app.
+Checked the desktop/CLI debug builds, 44 focused planning/store/migration/handoff/UI tests and
+an offscreen home render. The Windows debug app opened with the expected native title and was
+responding. Formatting, strict Clippy for the desktop/UI targets, layers, locks and secret checks
+passed. Live provider-driven builds and a release build were not exercised for this label change.
 
 ### Reviewed upstream synchronization through `76b52be` (R5.8)
 

@@ -11,6 +11,9 @@ use craft_anything_engine::Mode;
 use egui::viewport::ResizeDirection;
 use egui::{RichText, Ui, Vec2};
 
+/// Shared by the drawn title bar and the native window so local debug builds are recognizable.
+pub const APP_TITLE: &str = if cfg!(debug_assertions) { concat!("Craft Anything ", env!("CARGO_PKG_VERSION"), " — Planning Dev") } else { "Craft Anything" };
+
 /// macOS draws its own window buttons, frame and resize edges (#20).
 pub const NATIVE_FRAME: bool = cfg!(target_os = "macos");
 /// Height of the custom title bar. On macOS it matches the system's title bar, so its window
@@ -156,7 +159,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         if ui.add(crate::app_icon(22.0 * s).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
             app.state.screen = Screen::Home;
         }
-        ui.label(theme::label_text("Craft Anything", label(12.0, s)).color(t.text).strong());
+        ui.label(theme::label_text(APP_TITLE, label(12.0, s)).color(t.text).strong());
         let in_project = app.state.screen == Screen::Project;
         let project = if in_project { app.workspace.as_ref().map(|w| w.manifest.name.clone()) } else { app.view.project.clone() };
         let target = if in_project { None } else { app.view.active_target().map(|t| (t.name.clone(), t.kind)) };

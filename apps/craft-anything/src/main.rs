@@ -79,7 +79,7 @@ fn main() -> eframe::Result {
     log::info!("engine and AI ready; opening the window");
 
     let viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("Craft Anything")
+        .with_title(craft_anything_ui_egui::titlebar::APP_TITLE)
         .with_app_id("ai.storyteller.craft-anything")
         .with_inner_size([1360.0, 860.0])
         .with_min_inner_size([760.0, 520.0])
