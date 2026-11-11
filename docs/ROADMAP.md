@@ -741,6 +741,8 @@ complete while required checks or planned work remain unresolved.
       handoff, project migrations and ignored experiments — claimed: Codex, branch chore/r5.8-upstream-sync-20261110
 - [ ] Review the draft Thai/Estonian planning translations and translate the awaited
       `Project build plan` tool title across the catalogs.
+- [ ] Identify development builds in the visible and native window titles, then build and
+      verify the merged planning workflow — claimed: Codex, branch chore/r5.8-planning-dev-title-20261111
 - [ ] Add explicit scope revisions tied to the person's changed request, retaining the previous
       requirements and reason for reduction; ordinary plan progress updates preserve required scope.
 
