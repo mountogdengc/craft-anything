@@ -78,11 +78,11 @@ fn readiness_requires_every_check_and_essential_question_to_be_settled() {
     for fail in failures {
         let checks = [fail, pass.clone()];
         assert!(self_check::require_ready(&checks, 90.0, &[]).is_err(), "a passing last check cannot hide earlier failure");
-        assert!(!self_check::report(&checks, 90.0, &[]).contains("This would pass"));
+        assert!(!self_check::report(&checks, 90.0, &[], |_| true).contains("This would pass"));
     }
     let questions = [Unknown::new("The editing workflow has not been observed", "rebuild", Severity::High)];
     assert!(self_check::require_ready(std::slice::from_ref(&pass), 90.0, &questions).is_err());
-    assert!(!self_check::report(&[pass], 90.0, &questions).contains("This would pass"));
+    assert!(!self_check::report(&[pass], 90.0, &questions, |_| true).contains("This would pass"));
 }
 
 #[test]

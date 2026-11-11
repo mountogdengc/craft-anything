@@ -893,6 +893,7 @@ Read a Unity game's IL2CPP metadata	Leer los metadatos IL2CPP de un juego de Uni
 Read a game's files	Leer los archivos de un juego
 Read a project file	Leer un archivo del proyecto
 Read a setting	Leer un ajuste
+Read a text file	Leer un archivo de texto
 Read an app's screen	Leer la pantalla de una app
 Read bytes	Leer bytes
 Read comment	Leer comentario
@@ -1485,3 +1486,7 @@ About "{question}":	Sobre «{question}»:
 The project plan could not be read.	No se pudo leer el plan del proyecto.
 Update the build plan	Actualizar el plan de desarrollo
 Keep the project phases, missing information and checks together in one plan.	Mantén las fases del proyecto, la información que falta y las comprobaciones en un solo plan.
+Connecting to {name}… {seconds} s	Conectando con {name}… {seconds} s
+Stopped adding {name}.	Se dejó de añadir {name}.
+It isn't there any more, so {program} runs in its place.	Ya no está ahí, así que se usa {program} en su lugar.
+Use it	Usarlo

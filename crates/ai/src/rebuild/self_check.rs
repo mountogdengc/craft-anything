@@ -17,8 +17,11 @@ pub fn asks_dir(project: &Path) -> PathBuf {
     project.join("checks").join("asks")
 }
 
-/// The mark a run leaves beside a check request it has taken, until it answers, so
-/// `rebuild_check` can tell a check that is still going from a request no run took. None for an
+/// What a builder's check gets when the build is stopped while it runs.
+pub const STOPPED_ANSWER: &str = "The build was stopped before this check finished, so there is nothing to report.";
+
+/// The mark a run leaves beside a check request it has taken, so `rebuild_check` can tell a
+/// check that is still going from a request no run took; `rebuild_check` removes it. None for an
 /// id that isn't an inbox id (a request's file can carry any `id`): no mark outside the folder.
 pub fn taken_mark(project: &Path, id: &str) -> Option<PathBuf> {
     let valid = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
@@ -81,11 +84,18 @@ pub fn summary(checks: &[CheckResult], good_enough: f64) -> String {
     let held = claims.iter().filter(|c| c.passed).count();
     let claims_part = if claims.is_empty() { String::new() } else { format!(", {held} of {} claims hold", claims.len()) };
     let good = checks.iter().filter(|c| c.good(good_enough)).count();
-    match checks.iter().find_map(|c| c.similarity) {
+    let mut text = match checks.iter().find_map(|c| c.similarity) {
         Some(s) => format!("about {s:.0}% like the original{claims_part}"),
         None if good == checks.len() => format!("all {} checks pass{claims_part}", checks.len()),
         None => format!("{good} of {} checks pass{claims_part}", checks.len()),
+    };
+    let unverified: usize = checks.iter().map(|c| c.unknowns.len()).sum();
+    match unverified {
+        0 => {}
+        1 => text.push_str("; 1 comparison remains unverified"),
+        n => text.push_str(&format!("; {n} comparisons remain unverified")),
     }
+    text
 }
 
 /// Shared by the builder's check and final completion, so a passing last check cannot hide
@@ -106,13 +116,16 @@ pub(super) fn require_ready(checks: &[CheckResult], good_enough: f64, open: &[cr
 /// What the builder is told about its own check: each result with its likeness and the bar,
 /// what's still unknown (the checks' and its own open questions), where its pictures are, and
 /// whether it would pass.
-pub fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_evidence::Unknown]) -> String {
+pub fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_evidence::Unknown], can_refine: impl Fn(&CheckResult) -> bool) -> String {
     if checks.is_empty() {
         return "There was nothing to check yet.".into();
     }
     let mut lines = Vec::new();
     for c in checks {
         let mut line = format!("{}: {}", c.check, if c.passed { "passed" } else { "failed" });
+        if !c.good(good_enough) && !can_refine(c) {
+            line.push_str(" (incomplete; another builder turn cannot resolve this)");
+        }
         if let Some(s) = c.similarity {
             line.push_str(&format!(", {s:.0}% alike (needs {:.0}%)", c.good_enough.unwrap_or(good_enough)));
         }
@@ -125,7 +138,10 @@ pub fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_e
     }
     let unknowns: Vec<&str> = checks.iter().flat_map(|c| &c.unknowns).map(String::as_str).collect();
     if !unknowns.is_empty() {
-        lines.push(format!("Not compared, so it can't pass yet: {}. Make those parts exist and render, then check again.", unknowns.join(", ")));
+        lines.push(format!(
+            "Not compared, so it can't pass yet: {}. Compare suitable reference inputs and observed results where possible; keep the rest unverified.",
+            unknowns.join(", ")
+        ));
     }
     if !open.is_empty() {
         let shown: Vec<String> = open.iter().take(8).map(|u| format!("{} ({})", u.question, u.id)).collect();
@@ -143,6 +159,10 @@ pub fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_e
         Err(error) if checks.iter().any(|check| check.not_compared) => format!(
             "{} Get a readable picture with native_window_capture or ask the person with core_person_ask. Keep this result incomplete until the reference can be compared; more builder turns alone cannot provide the missing evidence.",
             error.message
+        ),
+        Err(e) if checks.iter().any(|c| !c.good(good_enough)) && !checks.iter().any(|c| !c.good(good_enough) && can_refine(c)) => format!(
+            "{} These checks remain incomplete; another builder turn cannot resolve them. Finish what you're doing and state the unverified comparisons in your reply.",
+            e.message
         ),
         Err(e) => format!("{} Not good enough yet: fix what it lists, build again, and check again with rebuild_check.", e.message),
     });
@@ -162,28 +182,38 @@ impl Worker {
                 log::warn!("couldn't mark the builder's check as taken ({}): {e}", mark.display());
             }
             let checking = "The builder is checking its work and available evidence…";
-            self.step(ws, Step::Build, Status::Building, checking)?;
-            let checked = self.checks_unless_unchanged(ws, kind.as_ref(), SELF_CHECK_ROUND, || {
-                self.run_checks_within(ws, kind.as_ref(), SELF_CHECK_ROUND, Some(SELF_CHECK_LIMIT))
+            // A stop during the initial step must answer the request too.
+            let checked = self.step(ws, Step::Build, Status::Building, checking).and_then(|()| {
+                self.checks_unless_unchanged(ws, kind.as_ref(), SELF_CHECK_ROUND, || {
+                    self.run_checks_within(ws, kind.as_ref(), SELF_CHECK_ROUND, Some(SELF_CHECK_LIMIT))
+                })
             });
             let (text, line) = match checked {
                 Ok(checks) => {
                     let line = format!("The builder checked its work: {}.", summary(&checks, good_enough));
                     match open_questions(ws) {
-                        Ok(open) => (report(&checks, good_enough, &open), line),
+                        Ok(open) => {
+                            let kind_checks = kind.checks(ws);
+                            (report(&checks, good_enough, &open, |c| kinds::can_refine(&kind_checks, c)), line)
+                        }
                         Err(e) => (
                             format!("{} Readiness is unverified until the investigation can be read.", e.message),
                             "The investigation questions could not be checked.".to_string(),
                         ),
                     }
                 }
-                Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
+                Err(e) if e.code == ErrorCode::Cancelled => {
+                    let stopped = Answer { text: Some(STOPPED_ANSWER.to_string()), ..Default::default() };
+                    if let Err(answer_error) = asks.answer(&r.id, &stopped) {
+                        log::warn!("couldn't tell the builder its check was stopped: {}", answer_error.message);
+                    }
+                    return Err(e);
+                }
                 Err(e) => (format!("The check couldn't run: {}", e.message), "The builder's check couldn't run.".to_string()),
             };
+            // The mark stays: the asker reads it after its wait, then removes it, so an answer
+            // that lands as the wait ends can't make a taken check look untaken.
             asks.answer(&r.id, &Answer { text: Some(text), ..Default::default() })?;
-            if let Some(mark) = &mark {
-                let _ = std::fs::remove_file(mark);
-            }
             self.step(ws, Step::Build, Status::Building, &line)?;
         }
         Ok(())
@@ -193,6 +223,10 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_evidence::Unknown]) -> String {
+        super::report(checks, good_enough, open, |_| true)
+    }
 
     #[test]
     fn the_report_says_what_differs_and_whether_it_would_pass() {
@@ -237,8 +271,33 @@ mod tests {
             unknowns: vec!["/about at 768 px couldn't be compared".into()],
             ..CheckResult::new(CheckResult::WEB_VISUAL, 0, true, "")
         };
-        let r = report(&[blind], 90.0, &[]);
+        let r = report(std::slice::from_ref(&blind), 90.0, &[]);
         assert!(r.contains("Not compared, so it can't pass yet: /about at 768 px") && r.contains("Not good enough yet"), "an unknown never passes: {r}");
+        assert_eq!(summary(std::slice::from_ref(&blind), 90.0), "about 95% like the original; 1 comparison remains unverified");
+        let unknowns = CheckResult { unknowns: vec!["first".into(), "second".into()], ..CheckResult::new("mechanics", 1, true, "readable") };
+        assert_eq!(summary(&[unknowns], 90.0), "0 of 1 checks pass; 2 comparisons remain unverified");
+    }
+
+    #[test]
+    fn an_unavailable_mechanics_oracle_does_not_ask_the_builder_to_retry() {
+        let c = CheckResult {
+            unknowns: vec!["Mechanics behavior has not been measured.".into()],
+            ..CheckResult::new("mechanics", 0, true, "The sheet is readable; behavior is unverified.")
+        };
+        let kind_checks: Vec<Box<dyn Check>> = vec![Box::new(MechanicsCheck), Box::new(BuildCheck)];
+        let text = super::report(std::slice::from_ref(&c), 90.0, &[], |r| kinds::can_refine(&kind_checks, r));
+        assert!(text.contains("another builder turn cannot resolve"), "{text}");
+        assert!(!text.contains("fix what it lists"), "{text}");
+        assert!(!text.contains("This would pass"), "uncertainty remains: {text}");
+        let failed = CheckResult::new("build", 0, false, "Build failed.");
+        let text = super::report(&[c, failed], 90.0, &[], |r| kinds::can_refine(&kind_checks, r));
+        assert!(text.ends_with("check again with rebuild_check."), "a refinable failure still needs work: {text}");
+        assert!(
+            text.contains("mechanics: passed (incomplete; another builder turn cannot resolve this)"),
+            "a mixed report identifies the unrefinable comparison: {text}"
+        );
+        assert!(text.contains("build: failed") && text.contains("Build failed."), "the actionable failure remains clear: {text}");
+        assert!(kinds::can_refine(&kind_checks, &CheckResult::new("plugin-check", 0, false, "failed")));
     }
 
     #[test]

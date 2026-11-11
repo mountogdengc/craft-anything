@@ -40,6 +40,12 @@ impl Assessment {
     pub fn blocked(reason: String, refinement: String) -> Self {
         Self { blockers: vec![reason], refinement: vec![refinement] }
     }
+    pub fn blocked_without_refinement(reason: String) -> Self {
+        Self { blockers: vec![reason], refinement: Vec::new() }
+    }
+    pub fn can_refine(&self) -> bool {
+        !self.refinement.is_empty()
+    }
     pub fn is_ready(&self) -> bool {
         self.blockers.is_empty()
     }
@@ -61,6 +67,10 @@ pub trait WorkflowExtension: Send + Sync + std::fmt::Debug {
     }
     /// Assess required obligations without changing them. Errors are blockers, never passes.
     fn assess(&self, ws: &Workspace, good_enough: f64) -> Result<Assessment, ToolError>;
+    /// Classify automatic follow-up work without removing any readiness obligations.
+    fn assess_refinement(&self, ws: &Workspace, good_enough: f64, _unrefinable_checks: &[String]) -> Result<Assessment, ToolError> {
+        self.assess(ws, good_enough)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,9 +101,17 @@ impl Extensions {
     }
 
     pub fn assess(&self, ws: &Workspace, good_enough: f64) -> Result<Assessment, ToolError> {
+        self.collect(|extension| extension.assess(ws, good_enough))
+    }
+
+    pub fn assess_refinement(&self, ws: &Workspace, good_enough: f64, unrefinable_checks: &[String]) -> Result<Assessment, ToolError> {
+        self.collect(|extension| extension.assess_refinement(ws, good_enough, unrefinable_checks))
+    }
+
+    fn collect(&self, mut assess: impl FnMut(&dyn WorkflowExtension) -> Result<Assessment, ToolError>) -> Result<Assessment, ToolError> {
         let mut total = Assessment::ready();
         for extension in &self.items {
-            let result = extension.assess(ws, good_enough)?;
+            let result = assess(extension.as_ref())?;
             total.blockers.extend(result.blockers);
             total.refinement.extend(result.refinement);
         }

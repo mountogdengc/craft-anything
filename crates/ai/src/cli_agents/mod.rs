@@ -72,10 +72,12 @@ pub fn program_of(config: &BackendConfig, options: &BackendOptions) -> Result<St
 }
 
 /// The saved program path `program` stands in for, when [`program_of`] chose another one (#721).
-/// A bare name (`claude.exe`) found as the same agent elsewhere isn't a replacement.
+/// A bare name (`claude.exe`) found as the same agent elsewhere isn't a replacement, nor is a path
+/// that's still there (a saved folder, or the Claude desktop app): it isn't gone.
 pub fn replaced_program(options: &BackendOptions, program: &str) -> Option<String> {
     let saved = options.command.as_deref().map(str::trim).filter(|c| !c.is_empty() && *c != program)?;
-    Path::new(saved).parent().is_some_and(|p| !p.as_os_str().is_empty()).then(|| saved.to_string())
+    let path = Path::new(saved);
+    (path.parent().is_some_and(|p| !p.as_os_str().is_empty()) && !path.exists()).then(|| saved.to_string())
 }
 
 /// Resolve saved commands locally through the shared lookup, but leave SSH commands untouched.
@@ -899,6 +901,13 @@ fn nothing_done(backend: &str) -> AgentEvent {
     AgentEvent::TurnDone { backend: backend.to_string(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false }
 }
 
+/// How long a turn's process may keep running after its stream already said the turn was done
+/// (Claude Code's final `result` line, or another adapter's equivalent) before we stop waiting on
+/// it. The turn is over once the stream says so; a shutdown hook or cleanup step that hangs after
+/// that must not leave the build "Pausing" for as long as the idle timeout allows (hours, for a
+/// builder turn, since a hung hook alone never touches stdout again to reset it).
+const RESULT_GRACE: Duration = Duration::from_secs(5);
+
 /// One message as one run of the agent's program (here or over SSH), its events sent on `tx`
 /// as they come. Returns the `TurnDone` that ends the turn, whatever happened, for the caller to
 /// send once the conversation can take the next message. The session it reports is kept for the
@@ -967,7 +976,10 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         }
     }
     let preamble = spec.preamble.clone().unwrap_or_else(|| crate::prompt::cli_preamble(spec.beginner));
-    let mcp = mcp_for(spec, remote.is_some());
+    let mut mcp = mcp_for(spec, remote.is_some());
+    if let Some(path) = remote.as_deref().and_then(adapters::remote_cli_path) {
+        mcp.command = path;
+    }
     let resume = session.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let text = if retry && adapter.resumes() && resume.is_some() { crate::failure::CONTINUE_TURN } else { text };
     let builder = spec.builder.is_some();
@@ -1034,6 +1046,10 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let failed_tools = Arc::new(AtomicBool::new(false));
     let (failed_tools2, failed_tools3) = (failed_tools.clone(), failed_tools.clone());
     let stop2 = stop.clone();
+    // Set once the stream's own terminal event is parsed, so the process is stopped `RESULT_GRACE`
+    // after rather than whenever it happens to exit (its own shutdown hooks aren't ours to wait on).
+    let result_seen: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+    let (result_seen2, result_seen3) = (result_seen.clone(), result_seen.clone());
     let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
         .args(&argv)
         .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
@@ -1043,7 +1059,10 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     let mut proc = proc
         .stdout_cap(4 * 1024 * 1024)
-        .cancel_when(move || stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst))
+        .cancel_when(move || {
+            let seen: Option<std::time::Instant> = *result_seen3.lock().unwrap_or_else(PoisonError::into_inner);
+            stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst) || seen.is_some_and(|at| at.elapsed() >= RESULT_GRACE)
+        })
         .on_stdout_line(move |l| {
             if failed_tools3.load(Ordering::SeqCst) {
                 return;
@@ -1064,6 +1083,12 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
                 *failure2.lock().unwrap_or_else(PoisonError::into_inner) = Some(failed);
                 if failed.kind == FailureKind::ToolsUnavailable {
                     failed_tools3.store(true, Ordering::SeqCst);
+                }
+            }
+            if p.saw_result {
+                let mut seen = result_seen2.lock().unwrap_or_else(PoisonError::into_inner);
+                if seen.is_none() {
+                    *seen = Some(std::time::Instant::now());
                 }
             }
             for e in events {
@@ -1090,10 +1115,16 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     } else if let Some(id) = &p.session_id {
         *session.lock().unwrap_or_else(PoisonError::into_inner) = Some(id.clone());
     }
+    // The stream already said the turn was done (its terminal `result` line): whatever ended the
+    // process after that — our own cancellation once `RESULT_GRACE` passed, or a wall/idle
+    // deadline that happened to fire in that same window — isn't a failure of the turn itself. A
+    // genuine protocol failure (`p.failure`, handled above) and a deadline hit before any result
+    // was parsed still are: this never excuses a turn that didn't finish.
+    let ended_after_result = p.saw_result && matches!(result.as_ref().err().map(|e| e.code), Some(ErrorCode::Cancelled) | Some(ErrorCode::TimedOut));
     if p.failure.is_none() {
         let failed = match &result {
             Ok(out) if !out.success => Some(TurnFailure::process_exit(out.code)),
-            Err(e) if e.code != ErrorCode::Cancelled => Some(TurnFailure::from_process(e)),
+            Err(e) if e.code != ErrorCode::Cancelled && !ended_after_result => Some(TurnFailure::from_process(e)),
             _ => None,
         };
         *failure.lock().unwrap_or_else(PoisonError::into_inner) = failed;
@@ -1126,6 +1157,10 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
             }
         }
         Ok(_) => {}
+        // The stream already said the turn was done; it's that result, not this cancellation or
+        // deadline, that ends the turn. Whatever kept the process itself running past that (a
+        // shutdown hook, logging, cleanup) isn't ours to wait on or report as a stop or a failure.
+        Err(_) if ended_after_result => {}
         Err(e) if e.code == craft_anything_evidence::ErrorCode::Cancelled => {
             let _ = tx.send(AgentEvent::Status { text: "Stopped.".into() });
         }
@@ -1357,6 +1392,8 @@ mod tests {
         assert_eq!(replaced_program(&BackendOptions::default(), "codex"), None, "nothing saved");
         let bare = BackendOptions { command: Some("claude.exe".into()), ..Default::default() };
         assert_eq!(replaced_program(&bare, "claude"), None, "a bare name found as the same agent");
+        let folder = new.parent().unwrap();
+        assert_eq!(replaced_program(&chosen(folder), &new.display().to_string()), None, "a saved folder that's there isn't gone");
         assert_eq!(program_of(&config(Some("box")), &chosen(&gone)).unwrap(), gone.display().to_string(), "another computer's path isn't checked here");
         assert_eq!(program_of(&config(None), &BackendOptions::default()).unwrap(), "codex", "nothing chosen: the usual name");
         // #467: a saved app bundle is never started; the usual name is looked up instead.
@@ -2370,6 +2407,24 @@ mod tests {
         assert!(matches!(&ev[2], AgentEvent::ToolFinished { ok: false, .. }));
     }
 
+    /// CodeRabbit review on #1426: `saw_result` alone now decides whether a lingering process
+    /// counts as a finished turn (`run_cli`'s `RESULT_GRACE`), so a `result` event that itself
+    /// reports failure must still fail the turn, not quietly succeed. Documented stream-json only
+    /// ever ends a run with `result` on success (a failure is its own `error` event instead), but
+    /// this is defensive: if a non-"success" status is ever sent on `result`, it must not be
+    /// silently swallowed the way an unrecognised field would be.
+    #[test]
+    fn a_gemini_result_that_reports_failure_still_fails_the_turn() {
+        let mut p = StreamParser::new(adapter_for("gemini-cli"));
+        let ev = p.line(&json!({"type":"result","status":"error","error":"the model refused the request"}).to_string());
+        assert!(p.saw_result, "a result line always marks the stream's turn as done");
+        assert!(ev.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("the model refused the request"))), "{ev:?}");
+        // An ordinary successful result still reports nothing extra.
+        let mut ok = StreamParser::new(adapter_for("gemini-cli"));
+        let ev = ok.line(&json!({"type":"result","status":"success","stats":{"input_tokens":1,"output_tokens":1}}).to_string());
+        assert!(ok.saw_result && ev.is_empty(), "{ev:?}");
+    }
+
     /// Login-shell, tool and network failures are not evidence that the account needs sign-in.
     #[test]
     fn codex_sign_in_guidance_only_matches_authentication_failures() {
@@ -2728,6 +2783,95 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
             }
             assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "round {round}: {events:?}");
         }
+    }
+
+    /// A fake `claude` that prints the turn's `result` line, then hangs well past it (standing in
+    /// for a shutdown hook or cleanup step that got stuck after Claude Code's own turn was done).
+    #[cfg(unix)]
+    fn hangs_after_its_result(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("claude");
+        let reply = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"s1"}"#;
+        // `exec`: sleep replaces the shell rather than running as its child, so the group kill
+        // that ends this stand-in doesn't depend on also reaching a grandchild process.
+        std::fs::write(&program, format!("#!/bin/sh\necho '{reply}'\nexec sleep 20\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[cfg(windows)]
+    fn hangs_after_its_result(dir: &std::path::Path) -> PathBuf {
+        let program = dir.join("claude.cmd");
+        let reply = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"s1"}"#;
+        std::fs::write(&program, format!("@echo off\r\necho {reply}\r\nping -n 21 127.0.0.1 >nul\r\n")).unwrap();
+        program
+    }
+
+    /// A turn whose stream already said it was done (the `result` line) must not stay "Building"
+    /// for as long as the process takes to actually exit: a shutdown hook or cleanup step that
+    /// hangs after that line isn't ours to wait on. Without `RESULT_GRACE`, this test would see no
+    /// `TurnDone` until the fake CLI's 20 s sleep ends; with it, `TurnDone` arrives within seconds.
+    #[test]
+    fn a_turn_already_said_done_ends_without_waiting_for_the_process_to_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = hangs_after_its_result(dir.path());
+        let config =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+        let mut spec = CliSpec::new(config, options, false, None);
+        // A short, single-line preamble: on Windows, a `.cmd` stand-in can't take the real
+        // multi-line default (a batch file's arguments can't carry a newline), which is beside
+        // the point of this test either way.
+        spec.preamble = Some("P:".into());
+        let mut c = CliConversation::new(spec);
+        c.send("go");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        loop {
+            let got = c.poll();
+            let done = got.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. }));
+            events.extend(got);
+            if done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no TurnDone within {RESULT_GRACE:?} of the result line: {events:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let bad = |e: &AgentEvent| matches!(e, AgentEvent::Error { .. }) || matches!(e, AgentEvent::Status { text } if text == "Stopped.");
+        assert!(!events.iter().any(bad), "{events:?}");
+    }
+
+    /// PR #1426 review: a wall deadline shorter than `RESULT_GRACE` can fire before our own grace
+    /// period does, even though the stream already parsed the terminal result. That race must
+    /// still count as the turn completing, not as a retryable failure (a builder could otherwise
+    /// retry a turn that had already finished).
+    #[test]
+    fn a_wall_deadline_during_result_grace_still_counts_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = hangs_after_its_result(dir.path());
+        let config =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        // Shorter than RESULT_GRACE: the result is parsed almost at once, but the process (asleep
+        // for 20 s) is still alive when this deadline, not our own grace period, ends the run.
+        let options = BackendOptions { command: Some(program.display().to_string()), timeout_secs: Some(2), ..Default::default() };
+        let mut spec = CliSpec::new(config, options, false, None);
+        spec.preamble = Some("P:".into());
+        let mut c = CliConversation::new(spec);
+        c.send("go");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        loop {
+            let got = c.poll();
+            let done = got.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. }));
+            events.extend(got);
+            if done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no TurnDone: {events:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let bad = |e: &AgentEvent| matches!(e, AgentEvent::Error { .. }) || matches!(e, AgentEvent::Status { text } if text == "Stopped.");
+        assert!(!events.iter().any(bad), "a result parsed before the wall deadline must not be reported as a failure: {events:?}");
     }
 
     /// #91: a Mac app with no CLI beside it reached Claude Code, which stopped with a stack trace.

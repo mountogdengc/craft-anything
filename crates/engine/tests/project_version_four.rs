@@ -2,6 +2,43 @@ use craft_anything_engine::workspace::{ActionKind, Approval, MANIFEST_VERSION, S
 use serde_json::{Value, json};
 
 #[test]
+fn both_version_five_histories_preserve_capture_modes_and_saved_choices() {
+    for (capture, expected) in [(None, json!(true)), (Some(Value::Null), Value::Null), (Some(json!(false)), json!(false)), (Some(json!(true)), json!(true))] {
+        let dir = tempfile::tempdir().unwrap();
+        let original = Workspace::create(dir.path(), "Capture migration", "Keep captured work", TargetRef::None).unwrap();
+        let path = original.root.join("craft.json");
+        std::fs::create_dir_all(original.capture_dir()).unwrap();
+        std::fs::write(original.capture_dir().join("README.md"), "Synthetic capture notes").unwrap();
+        let mut document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["version"] = json!(5);
+        document["status"] = json!("incomplete");
+        document["approvals"] = json!({"commands":"refuse"});
+        document["agent_session"] = json!("synthetic-session");
+        document["agent_session_by"] = json!("synthetic-agent");
+        document["agent_session_deep"] = json!(false);
+        document.as_object_mut().unwrap().remove("capture_deep");
+        if let Some(mode) = capture {
+            document["capture_deep"] = mode;
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let upgraded = Workspace::open(&original.root).unwrap();
+        assert_eq!(upgraded.manifest.version, MANIFEST_VERSION);
+        assert_eq!(upgraded.manifest.status, Status::Incomplete);
+        assert_eq!(upgraded.manifest.approval(ActionKind::Commands, true), Approval::Refuse);
+        upgraded.save().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["capture_deep"], expected, "missing legacy capture modes count as Deep; explicit modes and null remain unchanged");
+        assert_eq!(saved["agent_session_deep"], false, "capture migration cannot change the saved builder mode");
+        let copy = upgraded.duplicate("Capture copy").unwrap();
+        let copied: Value = serde_json::from_slice(&std::fs::read(copy.root.join("craft.json")).unwrap()).unwrap();
+        assert_eq!(copied["capture_deep"], expected);
+        assert_eq!(std::fs::read_to_string(copy.capture_dir().join("README.md")).unwrap(), "Synthetic capture notes");
+        assert_eq!(copied["approvals"]["commands"], "refuse");
+    }
+}
+
+#[test]
 fn both_version_four_histories_keep_session_modes_and_incomplete_work() {
     for mode in [None, Some(Value::Null), Some(json!(false)), Some(json!(true))] {
         let expected_mode = mode.as_ref().and_then(Value::as_bool).unwrap_or(true);

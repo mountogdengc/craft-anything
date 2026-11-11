@@ -21,7 +21,10 @@ impl KeptChecks {
         let kept = progress.checked.as_ref().and_then(|c| {
             let last = ws.manifest.checks.last()?.round;
             let round: Vec<CheckResult> = ws.manifest.checks.iter().filter(|r| r.round == c.round).cloned().collect();
-            (last == c.round && all_worked(&round)).then(|| (c.key.clone(), round))
+            // Older mechanics checks treated source literals as verified behavior. Current
+            // checks always record the unmeasured comparison; never reuse the old verdict.
+            let current_contract = round.iter().all(|check| check.check != kinds::MechanicsCheck::ID || !check.unknowns.is_empty());
+            (last == c.round && all_worked(&round) && current_contract).then(|| (c.key.clone(), round))
         });
         KeptChecks { files: AppFingerprintCache::default(), kept }
     }

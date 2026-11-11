@@ -120,7 +120,7 @@ fn supplied_pictures_survive_a_failed_first_runtime_study() {
     supplied_picture(&ws);
     let mut worker = check_worker(&ws, false);
     worker.engine.session().settings.runtime_study = true;
-    worker.study(&mut ws, &AppKind).unwrap();
+    worker.study(&mut ws, &AppKind, false).unwrap();
     assert!(!ws.capture_dir().join("window.png").exists());
     let notes = std::fs::read_to_string(ws.capture_dir().join("README.md")).unwrap();
     assert!(notes.contains("supplied reference"), "{notes}");
@@ -158,7 +158,7 @@ fn static_package_evidence_allows_work_without_claiming_a_comparison() {
     let mut ws = Workspace::create(dir.path(), "Static package", "Recreate this app", TargetRef::Local { path: package }).unwrap();
     completed_plan(&ws);
     let mut worker = check_worker(&ws, true);
-    worker.study(&mut ws, &AppKind).unwrap();
+    worker.study(&mut ws, &AppKind, true).unwrap();
     let turns = std::collections::VecDeque::from([
         turn(
             vec![Block::ToolUse {

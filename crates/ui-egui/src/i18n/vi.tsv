@@ -893,6 +893,7 @@ Read a Unity game's IL2CPP metadata	Đọc siêu dữ liệu IL2CPP của một 
 Read a game's files	Đọc các tệp của một trò chơi
 Read a project file	Đọc một tệp dự án
 Read a setting	Đọc một cài đặt
+Read a text file	Đọc một tệp văn bản
 Read an app's screen	Đọc màn hình của một ứng dụng
 Read bytes	Đọc byte
 Read comment	Đọc chú thích
@@ -1485,3 +1486,7 @@ About "{question}":	Về "{question}":
 The project plan could not be read.	Không thể đọc kế hoạch dự án.
 Update the build plan	Cập nhật kế hoạch phát triển
 Keep the project phases, missing information and checks together in one plan.	Giữ các giai đoạn dự án, thông tin còn thiếu và các bước kiểm tra trong cùng một kế hoạch.
+Connecting to {name}… {seconds} s	Đang kết nối với {name}… {seconds} giây
+Stopped adding {name}.	Đã dừng thêm {name}.
+It isn't there any more, so {program} runs in its place.	Nó không còn ở đó nữa, nên {program} chạy thay thế.
+Use it	Dùng nó
